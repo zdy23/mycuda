@@ -1,108 +1,187 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
-#include <stdlib.h>
-#include <time.h>
+#include <random>
 
 
-const int maxn = 100, minn = -100;
-void initData(int* nums, int size) {
-	srand(time(NULL));	
-	for (int i = 0; i < size; i++) {
-		nums[i] = rand() % (maxn - minn + 1) + minn;
-	}
+
+void initializeData(int *data, int n) {
+    std::random_device rd; // 随机数生成器
+    std::mt19937 gen(rd()); // 使用 Mersenne Twister 算法的随机数引擎
+    std::uniform_int_distribution<> dis(1, 100); // 生成 1 到 100 之间的随机整数
+
+    for (int i = 0; i < n; ++i) {
+        data[i] = dis(gen); // 生成随机整数并赋值给数组
+    }
 }
 
-__global__ void reduceDivergent(int* input, int* output, int size) {
-	int tid = threadIdx.x;
-	int idx = blockIdx.x * blockDim.x + tid;
+__global__ void reduceDivergent(int *input, int *output, int n) {
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-	if (idx >= size) return;
+    int *data = input + blockDim.x + blockIdx.x;
+    if (idx >= n) return;
 
-	for (int stride = 1; stride < blockDim.x; stride *= 2) {
-		if (tid % (2 * stride) == 0) {
-			input[idx] += input[idx + stride];
-		}
-		__syncthreads();
-	}
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        if (tid % (2 * stride) == 0) {
+            data[tid] += data[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = data[0];
+    }
 }
 
-__global__ void reduceNotDivergent(int* input, int* output, int size) {
-	int tid = threadIdx.x;
-	int idx = blockIdx.x * blockDim.x + tid;
+__global__ void reduceLessDivergent(int *input, int *output, int n) {
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-	if (idx >= size) return;
+    int *data = input + blockDim.x + blockIdx.x;
+    if (idx >= n) return;
 
-	for (int stride = 1; stride < blockDim.x; stride *= 2) {
-		int index = 2 * stride * tid;
-		if (index < blockDim.x) {
-			output[index] = input[index] + input[index + stride];
-		}
-		__syncthreads();
-	}
-}	
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        int index = 2 * stride * tid;
+        if (index < n) {
+            data[index] += data[index + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = data[0];
+    }
+}
 
-__global__ void reduceInterLeaved(int* input, int* output, int size) {
-	int tid = threadIdx.x;
-	int idx = blockIdx.x * blockDim.x + tid;
+__global__ void reduceInterleaved(int *input, int *output, int n) {
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-	if (idx >= size) return;
+    int *data = input + blockDim.x + blockIdx.x;
+    if (idx >= n) return;
 
-	for (int stride = blockDim.x / 2; stride > 0; stride >>= 2) {
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            data[tid] += data[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[blockIdx.x] = data[0];
+    }   
+}
+
+// Shared Memory + Warp Unrolling
+__global__ void reduceWarpUnrolling(int *input, int *output, int n) {
+	unsigned int tid = threadIdx.x;
+	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+	int *data = input + blockDim.x + blockIdx.x;
+	if (idx >= n) return;
+
+	for (int stride = blockDim.x / 2; stride > 32; stride >>= 1) {
 		if (tid < stride) {
-			input[idx] += input[idx + stride];
+			data[tid] += data[tid + stride];
 		}
 		__syncthreads();
+	}
+
+	if (tid < 32) {
+		int val = data[tid];
+		for (int offset = 16; offset > 0; offset >>= 1)	{
+			val += __shfl_down_sync(0xffffffff, val, offset);
+		}
+		if (tid == 0) {
+			data[0] = val;
+		}
+	}
+
+	if (tid == 0) {
+		output[blockIdx.x] = data[0];
+	}
+} 
+
+__global__ void reduceFinal(const int* input, int* output, int n) {
+	extern __shared__ int sdata[]; // Shared memory for partial sums
+
+	unsigned int tid = threadIdx.x;
+	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+	sdata[tid] = (idx < n) ? input[idx] : 0; // Load input into shared memory
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			sdata[tid] += sdata[tid + stride];
+		}
+		__syncthreads();
+	}
+
+	if (tid < 32) {
+		int val = sdata[tid];
+		for (int offset = 16; offset > 0; offset >>= 1) {
+			val += __shfl_down_sync(0xffffffff, val, offset);
+		}
+		if (tid == 0) {
+			sdata[0] = val;
+		}
+	}
+
+	if (tid == 0) {
+		output[blockIdx.x] = sdata[0];
 	}
 }
 
 int main() {
-	int N = 256;
-	int *h_input = new int[N];
-	int *h_output = new int[N];
-	initData(h_input, N);
+    int n = 1 << 14;
+    int *h_input = (int *)malloc(n * sizeof(int));
+    int *h_output = (int *)malloc((n / 256) * sizeof(int));
 
-	int *d_input = nullptr;
-	int *d_output = nullptr;
-	cudaMalloc(&d_input, N * sizeof(int));
-	cudaMalloc(&d_output, N * sizeof(int));
+    initializeData(h_input, n);
 
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
+    int *d_input, *d_output;
+    cudaMalloc((void **)&d_input, n * sizeof(int));
+    cudaMalloc((void **)&d_output, (n / 256) * sizeof(int));
+    cudaMemcpy(d_input, h_input, n * sizeof(int), cudaMemcpyHostToDevice);
 
-	cudaEventRecord(start);
-	reduceDivergent<<<(N + 255) / 256, 256>>>(d_input, d_output, N);
-	cudaMemcpy(d_input, h_input, N * sizeof(int), cudaMemcpyHostToDevice);
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-	float milliseconds = 0;
-	
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	printf("Time: %f ms\n", milliseconds);
+    cudaEventRecord(start);
+    reduceDivergent<<<n / 256, 256>>>(d_input, d_output, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop); 
 
-	cudaEventRecord(start);
-	reduceNotDivergent<<<(N + 255) / 256, 256>>>(d_input, d_output, N);
-	cudaMemcpy(d_input, h_input, N * sizeof(int), cudaMemcpyHostToDevice);
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
+    float millisecondsDivergent = 0;
+    cudaEventElapsedTime(&millisecondsDivergent, start, stop);
 
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	printf("Time: %f ms\n", milliseconds);
+    printf("Divergent reduce time: %f ms\n", millisecondsDivergent);
 
-	cudaEventRecord(start);
-	reduceInterLeaved<<<(N + 255) / 256, 256>>>(d_input, d_output, N);
-	cudaMemcpy(d_input, h_input, N * sizeof(int), cudaMemcpyHostToDevice);
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
+    cudaEventRecord(start);
+    reduceLessDivergent<<<n / 256, 256>>>(d_input, d_output, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	printf("Time: %f ms\n", milliseconds);
+    float millisecondsLessDivergent = 0;
+    cudaEventElapsedTime(&millisecondsLessDivergent, start, stop);
 
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-	cudaFree(d_input);
-	cudaFree(d_output);
-	delete[] h_input;
-	delete[] h_output;
+    printf("Less divergent reduce time: %f ms\n", millisecondsLessDivergent);
+
+    cudaEventRecord(start);
+    reduceInterleaved<<<n / 256, 256>>>(d_input, d_output, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float millisecondsInterleaved = 0;
+    cudaEventElapsedTime(&millisecondsInterleaved, start, stop);
+
+    printf("Interleaved reduce time: %f ms\n", millisecondsInterleaved);
+
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    free(h_input);
+    free(h_output);
+
+    return 0;
 }
