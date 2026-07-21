@@ -1,5 +1,16 @@
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdio.h>
+
+#define CHECK(call)                                                            \
+  do {                                                                         \
+    const cudaError_t error = call;                                            \
+    if (error != cudaSuccess) {                                                \
+      printf("Error: %s:%d, ", __FILE__, __LINE__);                            \
+      printf("code: %d, reason: %s\n", error, cudaGetErrorString(error));      \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
 
 __global__ void reduceUnrollWarps8(int *input, int *output, unsigned int n) {
   __shared__ int sdata[256]; // Shared memory for partial sums
@@ -111,59 +122,72 @@ __global__ void reduceCompleteUnrollingWarp8(int *input, int *output,
   }
 }
 
+int cpuReduce(int *data, int n) {
+  int sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += data[i];
+  }
+  return sum;
+}
+
 int main() {
 
-  int N = 1 << 20; // Size of the array (1 million elements)
-  int *h_input = (int *)malloc(N * sizeof(int));
-  int *h_output = (int *)malloc(sizeof(int)); // Output will be a single value
-  int *d_input, *d_output;
-  cudaMalloc((void **)&d_input, N * sizeof(int));
-  cudaMalloc((void **)&d_output, N * sizeof(int));
-  for (int i = 0; i < N; i++) {
-    h_input[i] = 1; // For simplicity, fill the array with 1s
-  }
-  int blockSize = 256;
-  int gridSize = (N + blockSize * 8 - 1) / (blockSize * 8);
+  const unsigned int N = 1 << 24;
+  const int blockSize = 256;
+  const int gridSize = (N + blockSize * 8 - 1) / (blockSize * 8);
 
-  cudaFree(0); // Initialize CUDA context
-  for (int i = 0; i < 5; i++) {
-    cudaMemcpy(d_input, h_input, N * sizeof(int), cudaMemcpyHostToDevice);
-    reduceUnrollWarps8<<<gridSize, blockSize>>>(d_input, d_output, N);
+  printf("Grid size: %d, Block size: %d\n", gridSize, blockSize);
+
+  int *h_input = (int *)malloc(N * sizeof(int));
+  int *h_output = (int *)malloc(gridSize * sizeof(int));
+  int *h_partialSums = (int *)malloc(gridSize * sizeof(int));
+
+  for (int i = 0; i < N; i++) {
+    h_input[i] = 1; // Initialize input array with 1s
   }
+
+  int *d_input, *d_partialSums, *d_output;
+  CHECK(cudaMalloc((void **)&d_input, N * sizeof(int)));
+  CHECK(cudaMalloc((void **)&d_partialSums, gridSize * sizeof(int)));
+  CHECK(cudaMalloc((void **)&d_output, gridSize * sizeof(int)));
+
+  CHECK(cudaMemcpy(d_input, h_input, N * sizeof(int), cudaMemcpyHostToDevice));
 
   cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
+  CHECK(cudaEventCreate(&start));
+  CHECK(cudaEventCreate(&stop));
 
-  cudaEventRecord(start);
-  reduceUnrollWarps8<<<gridSize, blockSize>>>(d_input, d_output, N);
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost);
-  float reduceUnrolling8_milliseconds = 0;
-  cudaEventElapsedTime(&reduceUnrolling8_milliseconds, start, stop);
-  printf("Result of reduction: %d\n", h_output[0]);
-  printf("Time taken for reduction with warp unrolling: %f ms\n",
-         reduceUnrolling8_milliseconds);
+  // === test kernel1 ===
+  CHECK(cudaEventRecord(start));
+  reduceCompleteUnrollingWarp8<<<gridSize, blockSize>>>(d_input, d_partialSums,
+                                                        N);
+  reduceUnrollWarps8<<<1, blockSize>>>(d_partialSums, d_output, N);
+  CHECK(cudaEventRecord(stop));
+  CHECK(cudaEventSynchronize(stop));
 
-  cudaEventRecord(start);
-  reduceCompleteUnrollingWarp8<<<gridSize, blockSize>>>(d_input, d_output, N);
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
-  cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost);
-  float reduceCompleteUnrollingWarp8_milliseconds = 0;
-  cudaEventElapsedTime(&reduceCompleteUnrollingWarp8_milliseconds, start, stop);
-  printf("Result of reduction: %d\n", h_output[0]);
-  printf("Time taken for complete unrolling with warp unrolling: %f ms\n",
-         reduceCompleteUnrollingWarp8_milliseconds);
+  float ms1 = 0;
+  CHECK(cudaEventElapsedTime(&ms1, start, stop));
+  CHECK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
 
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-  cudaFree(d_input);
-  cudaFree(d_output);
-  free(h_input);
-  free(h_output);
-  cudaDeviceReset();
+  int cpu_result = cpuReduce(h_input, N);
+  printf("CPU result: %d, GPU result: %d\n", cpu_result, h_output[0]);
+  printf("Time: %.3f ms\n", ms1);
+  printf(h_output[0] == cpu_result ? "Success\n" : "Failure\n");
+
+  // === test kernel2 ===
+  CHECK(cudaEventRecord(start));
+  reduceUnrollWarps8<<<gridSize, blockSize>>>(d_input, d_partialSums, N);
+  reduceUnrollWarps8<<<1, blockSize>>>(d_partialSums, d_output, N);
+  CHECK(cudaEventRecord(stop));
+  CHECK(cudaEventSynchronize(stop));
+
+  float ms2 = 0;
+  CHECK(cudaEventElapsedTime(&ms2, start, stop));
+  CHECK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+  printf("CPU result: %d, GPU result: %d\n", cpu_result, h_output[0]);
+  printf("Time: %.3f ms\n", ms2);
+  printf(h_output[0] == cpu_result ? "Success\n" : "Failure\n");
 
   return 0;
 }
