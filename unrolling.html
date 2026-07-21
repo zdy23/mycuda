@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>reduceWarpUnrolling 全过程</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2332;
+    --border: #2d3a4f;
+    --text: #e7ecf3;
+    --muted: #8b9bb4;
+    --accent: #3d9cf0;
+    --active: #f0b429;
+    --src: #e85d75;
+    --dst: #3ecf8e;
+    --idle: #2a3548;
+    --code-bg: #0b1017;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  header {
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #152030, var(--bg));
+  }
+  header h1 {
+    margin: 0 0 0.35rem;
+    font-size: 1.35rem;
+    font-weight: 650;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.92rem;
+    max-width: 70rem;
+  }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 1rem;
+    padding: 1rem 1.5rem 2rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (max-width: 960px) {
+    main { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem;
+  }
+  .panel h2 {
+    margin: 0 0 0.75rem;
+    font-size: 0.95rem;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+  button, select {
+    background: #243044;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.primary {
+    background: #1e4d7a;
+    border-color: var(--accent);
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .step-title {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+  }
+  .step-desc {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 0.85rem;
+    min-height: 2.6em;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1.25rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+  }
+  .legend span::before {
+    content: "";
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: -1px;
+  }
+  .legend .l-dst::before { background: var(--dst); }
+  .legend .l-src::before { background: var(--src); }
+  .legend .l-active::before { background: var(--active); }
+  .legend .l-idle::before { background: var(--idle); border: 1px solid var(--border); }
+
+  .section-label {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin: 0.6rem 0 0.35rem;
+  }
+  .grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+  .cell {
+    width: 28px;
+    height: 28px;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    background: var(--idle);
+    border: 1px solid transparent;
+    color: #c5d0e0;
+    transition: background 0.15s, border-color 0.15s, transform 0.15s;
+    font-variant-numeric: tabular-nums;
+  }
+  .cell.sm { width: 22px; height: 22px; font-size: 9px; }
+  .cell.src {
+    background: rgba(232, 93, 117, 0.35);
+    border-color: var(--src);
+  }
+  .cell.dst {
+    background: rgba(62, 207, 142, 0.4);
+    border-color: var(--dst);
+    color: #fff;
+    font-weight: 600;
+  }
+  .cell.active {
+    background: rgba(240, 180, 41, 0.45);
+    border-color: var(--active);
+  }
+  .cell.dead {
+    opacity: 0.28;
+  }
+  .cell.hl {
+    box-shadow: 0 0 0 2px var(--accent);
+    transform: scale(1.05);
+    z-index: 1;
+  }
+
+  .meta {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    margin-bottom: 0.75rem;
+  }
+  .meta div {
+    background: var(--code-bg);
+    border-radius: 6px;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--border);
+  }
+  .meta strong { color: var(--accent); font-weight: 600; }
+
+  pre.code {
+    margin: 0;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    font-size: 0.78rem;
+    overflow-x: auto;
+    line-height: 1.45;
+    color: #b8c7dc;
+  }
+  pre.code .hi {
+    color: #7dd3a7;
+    font-weight: 600;
+  }
+  .progress {
+    height: 6px;
+    background: var(--idle);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 0.5rem 0 1rem;
+  }
+  .progress > i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--dst));
+    width: 0%;
+    transition: width 0.2s;
+  }
+  .phase-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.85rem;
+  }
+  .phase-list li {
+    padding: 0.4rem 0.5rem;
+    border-radius: 5px;
+    color: var(--muted);
+    border-left: 3px solid transparent;
+    margin-bottom: 2px;
+    cursor: pointer;
+  }
+  .phase-list li:hover { background: #223044; }
+  .phase-list li.cur {
+    color: var(--text);
+    background: #243548;
+    border-left-color: var(--accent);
+  }
+  .phase-list li.done { color: #6a9e80; }
+  .note {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+  .sum-box {
+    margin-top: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: #13281f;
+    border: 1px solid #2a6b4a;
+    border-radius: 6px;
+    font-size: 0.9rem;
+  }
+  .sum-box strong { color: var(--dst); }
+</style>
+</head>
+<body>
+<header>
+  <h1>reduceWarpUnrolling 全过程可视化</h1>
+  <p>
+    对应 <code>reduce.cu</code>：每 block 处理 <strong>2 × blockDim</strong> 个 global 元素 →
+    写入 shared <code>sdata[blockDim]</code> → tree 归约到 64 个 partial →
+    last warp 折叠 + <code>__shfl_down_sync</code> → <code>output[blockIdx]</code>。
+    默认用缩小版 <strong>blockDim=16</strong>（逻辑同 256：stride 直到 &gt; 32 在 16 上会直接进入 last-warp 段，见下方说明）。
+  </p>
+</header>
+<main>
+  <section class="panel">
+    <div class="controls">
+      <label>
+        演示规模
+        <select id="mode">
+          <option value="16">blockDim=16（清晰）</option>
+          <option value="32">blockDim=32</option>
+          <option value="64">blockDim=64</option>
+          <option value="256">blockDim=256（贴近真码）</option>
+        </select>
+      </label>
+      <button id="btnPrev">上一步</button>
+      <button id="btnNext" class="primary">下一步</button>
+      <button id="btnPlay">自动播放</button>
+      <button id="btnReset">重置</button>
+    </div>
+    <div class="progress"><i id="bar"></i></div>
+    <div class="step-title" id="stepTitle">—</div>
+    <div class="step-desc" id="stepDesc">—</div>
+    <div class="legend">
+      <span class="l-dst">写入 / 累加目标</span>
+      <span class="l-src">被加数来源</span>
+      <span class="l-active">本步活跃线程 / 寄存器 val</span>
+      <span class="l-idle">未改动</span>
+    </div>
+
+    <div class="section-label">Global input（本 block 覆盖的一段，长度 2×blockDim）</div>
+    <div class="grid" id="globalGrid"></div>
+
+    <div class="section-label">Shared sdata[blockDim] · 或 last-warp 寄存器 val[]</div>
+    <div class="grid" id="sdataGrid"></div>
+
+    <div class="sum-box" id="sumBox" hidden>
+      block 结果 <code>output[blockIdx.x]</code> = <strong id="blockSum">?</strong>
+      （应等于本段 global 之和 <strong id="expectSum">?</strong>）
+    </div>
+  </section>
+
+  <aside class="panel">
+    <h2>步骤</h2>
+    <ul class="phase-list" id="phaseList"></ul>
+
+    <h2 style="margin-top:1rem">本步伪代码</h2>
+    <pre class="code" id="codeBox"></pre>
+
+    <div class="meta" style="margin-top:0.75rem">
+      <div>blockDim <strong id="mBd">16</strong></div>
+      <div>覆盖元素 <strong id="mN">32</strong></div>
+      <div>stride / offset <strong id="mStride">—</strong></div>
+      <div>活跃 tid <strong id="mActive">—</strong></div>
+    </div>
+
+    <p class="note">
+      <strong>与真码对应：</strong>真码 <code>blockDim=256</code> 时 shared 循环
+      <code>stride = 128, 64</code>（条件 <code>stride &gt; 32</code>），
+      然后 <code>sdata[tid]+=sdata[tid+32]</code>，再
+      <code>offset = 16..1</code> 的 shuffle。
+      小规模演示会跳过不存在的大 stride，但 last-warp 逻辑一致。
+      <br /><br />
+      打开方式：浏览器打开本文件即可，无需服务器。
+    </p>
+  </aside>
+</main>
+
+<script>
+/**
+ * Pedagogical simulator of reduceWarpUnrolling (one block, blockIdx=0).
+ * Matches reduce.cu structure for blockDim that are powers of 2.
+ */
+(function () {
+  const $ = (id) => document.getElementById(id);
+
+  let blockDim = 16;
+  let input = [];
+  let sdata = [];
+  let valReg = null; // last-warp registers, length 32 or blockDim/2 after fold
+  let steps = [];
+  let stepIdx = 0;
+  let playTimer = null;
+
+  function randInput(n) {
+    const a = new Array(n);
+    for (let i = 0; i < n; i++) a[i] = 1 + Math.floor(Math.random() * 9);
+    return a;
+  }
+
+  function buildSteps(bd, arr) {
+    const n = bd * 2;
+    const list = [];
+
+    // snapshot helpers
+    const snapS = (s) => s.slice();
+    const emptyHL = () => ({ src: [], dst: [], active: [], dead: [], mode: "sdata" });
+
+    // Step 0: initial
+    list.push({
+      title: "0 · 初始状态",
+      desc: `blockIdx=0，idx = tid；每线程将处理 global[tid] 与 global[tid+${bd}]。input 只读。`,
+      sdata: new Array(bd).fill(null),
+      input: arr.slice(),
+      hl: emptyHL(),
+      stride: "—",
+      active: "—",
+      code: `// reduceWarpUnrolling, one block\n__shared__ int sdata[${bd}];\nidx = blockIdx.x * (blockDim.x * 2) + tid;`,
+    });
+
+    // Step 1: load
+    const afterLoad = new Array(bd);
+    const loadSrc = [], loadDst = [];
+    for (let tid = 0; tid < bd; tid++) {
+      const idx = tid;
+      afterLoad[tid] = arr[idx];
+      if (idx + bd < n) afterLoad[tid] += arr[idx + bd];
+      loadDst.push(tid);
+      loadSrc.push(idx, idx + bd);
+    }
+    list.push({
+      title: "1 · 两路加载进 shared",
+      desc: `sdata[tid] = input[idx] + input[idx+blockDim]（越界则只加存在的项）。之后 input 不再写入。`,
+      sdata: afterLoad.slice(),
+      input: arr.slice(),
+      hl: { src: loadSrc, dst: loadDst, active: loadDst, dead: [], mode: "sdata", globalSrc: true },
+      stride: "—",
+      active: `0..${bd - 1}`,
+      code: `sdata[tid] = (idx < n) ? input[idx] : 0;\nif (idx + blockDim.x < n)\n  sdata[tid] += input[idx + blockDim.x];\n__syncthreads();`,
+    });
+
+    // Shared tree: stride = bd/2; stride > 32; stride >>= 1
+    // For bd<=32, this loop body never runs (same as real code when no large strides).
+    let cur = afterLoad.slice();
+    for (let stride = bd / 2; stride > 32; stride >>= 1) {
+      const prev = cur.slice();
+      const src = [], dst = [], active = [];
+      for (let tid = 0; tid < stride; tid++) {
+        cur[tid] = prev[tid] + prev[tid + stride];
+        dst.push(tid);
+        src.push(tid + stride);
+        active.push(tid);
+      }
+      const dead = [];
+      for (let t = stride; t < bd; t++) dead.push(t);
+      list.push({
+        title: `Shared tree · stride = ${stride}`,
+        desc: `if (tid < ${stride}) sdata[tid] += sdata[tid + ${stride}]；然后 __syncthreads()。活跃线程连续，访存较 interleaved 友好。`,
+        sdata: cur.slice(),
+        input: arr.slice(),
+        hl: { src, dst, active, dead, mode: "sdata" },
+        stride: String(stride),
+        active: `tid < ${stride}`,
+        code: `for (stride = blockDim/2; stride > 32; stride >>= 1) {\n  if (tid < stride)\n    sdata[tid] += sdata[tid + stride];\n  __syncthreads();\n}`,
+      });
+    }
+
+    // After loop: if bd>=64, we have 64 partials in sdata[0..63]
+    // if bd==32, still 32 values (loop skipped)
+    // if bd==16, 16 values
+    // Real code always does: if (tid < 32) sdata[tid] += sdata[tid+32]
+    // For bd < 64, tid+32 may be out of range of meaningful data — real kernel assumes bd>=64 typically.
+    // Pedagogical: only show fold when bd >= 64; for smaller, note skip / map to shuffle-only.
+
+    let afterFold = cur.slice();
+    if (bd >= 64) {
+      const prev = cur.slice();
+      const src = [], dst = [], active = [];
+      for (let tid = 0; tid < 32; tid++) {
+        afterFold[tid] = prev[tid] + prev[tid + 32];
+        dst.push(tid);
+        src.push(tid + 32);
+        active.push(tid);
+      }
+      const dead = [];
+      for (let t = 32; t < bd; t++) dead.push(t);
+      list.push({
+        title: "Last warp · 折叠 64→32",
+        desc: `if (tid < 32) sdata[tid] += sdata[tid + 32]。此时完整 block 和的 32 个 partial 在 sdata[0..31]。`,
+        sdata: afterFold.slice(),
+        input: arr.slice(),
+        hl: { src, dst, active, dead, mode: "sdata" },
+        stride: "+32",
+        active: "tid < 32",
+        code: `if (tid < 32) {\n  sdata[tid] += sdata[tid + 32];\n  int val = sdata[tid];\n  // shuffle next...\n}`,
+      });
+      cur = afterFold;
+    } else {
+      list.push({
+        title: "Last warp · 折叠 +32（本规模跳过）",
+        desc: `真码 blockDim=256 时此处把 sdata[0..63] 收成 32 路。当前 blockDim=${bd} < 64，无 tid+32 有效 partial，演示直接进入 shuffle（用 sdata[0..${Math.min(31, bd - 1)}]）。`,
+        sdata: cur.slice(),
+        input: arr.slice(),
+        hl: { src: [], dst: [], active: [], dead: [], mode: "sdata" },
+        stride: "skip",
+        active: "—",
+        code: `// bd=${bd}: no 64-wide partials\n// real code (bd=256):\nsdata[tid] += sdata[tid + 32];`,
+      });
+    }
+
+    // Shuffle: val in registers for tid < min(32, bd)
+    const warpN = Math.min(32, bd);
+    let vals = [];
+    for (let tid = 0; tid < warpN; tid++) vals.push(cur[tid]);
+
+    list.push({
+      title: "装入寄存器 val",
+      desc: `int val = sdata[tid]；后续只在 warp 内用 __shfl_down_sync 通信，不再 __syncthreads。`,
+      sdata: cur.slice(),
+      vals: vals.slice(),
+      input: arr.slice(),
+      hl: {
+        src: [],
+        dst: [],
+        active: Array.from({ length: warpN }, (_, i) => i),
+        dead: Array.from({ length: bd }, (_, i) => i).filter((i) => i >= warpN),
+        mode: "val",
+      },
+      stride: "—",
+      active: `tid < ${warpN}`,
+      code: `int val = sdata[tid];\nfor (offset = 16; offset > 0; offset >>= 1)\n  val += __shfl_down_sync(0xffffffff, val, offset);`,
+    });
+
+    // shuffle offsets: start from 16 down, but if warpN<=16 start from warpN/2
+    let maxOff = 16;
+    while (maxOff >= warpN) maxOff >>= 1;
+    for (let offset = maxOff; offset > 0; offset >>= 1) {
+      const prev = vals.slice();
+      const src = [], dst = [], active = [];
+      for (let tid = 0; tid < warpN; tid++) {
+        if (tid + offset < warpN) {
+          vals[tid] = prev[tid] + prev[tid + offset];
+          dst.push(tid);
+          src.push(tid + offset);
+        }
+        active.push(tid);
+      }
+      list.push({
+        title: `Shuffle · offset = ${offset}`,
+        desc: `val += __shfl_down_sync(mask, val, ${offset})：线程 tid 读到 tid+offset 的 val 并累加到自己。最终 tid=0 持有 warp（即 block）总和。`,
+        sdata: cur.slice(),
+        vals: vals.slice(),
+        input: arr.slice(),
+        hl: { src, dst, active, dead: [], mode: "val" },
+        stride: String(offset),
+        active: `tid < ${warpN}`,
+        code: `val += __shfl_down_sync(0xffffffff, val, ${offset});`,
+      });
+    }
+
+    const expect = arr.reduce((a, b) => a + b, 0);
+    const got = vals[0];
+    list.push({
+      title: "写回 output[blockIdx.x]",
+      desc: `if (tid == 0) output[blockIdx.x] = val。这是本 block 的 partial sum，不是全数组最终和（全数组需再归约 grid 个 partial）。`,
+      sdata: cur.slice(),
+      vals: vals.slice(),
+      input: arr.slice(),
+      hl: {
+        src: [],
+        dst: [0],
+        active: [0],
+        dead: Array.from({ length: bd }, (_, i) => i).filter((i) => i !== 0),
+        mode: "val",
+      },
+      stride: "—",
+      active: "tid == 0",
+      code: `if (tid == 0)\n  output[blockIdx.x] = val;`,
+      result: { got, expect },
+    });
+
+    return list;
+  }
+
+  function renderGrid(el, values, hl, kind, bd) {
+    el.innerHTML = "";
+    const useSm = values.length > 64;
+    const mode = hl.mode || "sdata";
+    const showVal = mode === "val" && hl.valsOverlay;
+
+    values.forEach((v, i) => {
+      const c = document.createElement("div");
+      c.className = "cell" + (useSm ? " sm" : "");
+      if (v === null || v === undefined) {
+        c.textContent = "·";
+        c.classList.add("dead");
+      } else {
+        c.textContent = String(v);
+      }
+      if (hl.dead && hl.dead.includes(i)) c.classList.add("dead");
+      if (hl.src && hl.src.includes(i)) c.classList.add("src");
+      if (hl.dst && hl.dst.includes(i)) c.classList.add("dst");
+      if (hl.active && hl.active.includes(i) && kind === "sdata" && mode === "sdata")
+        c.classList.add("active");
+      c.title = `${kind}[${i}] = ${v}`;
+      el.appendChild(c);
+    });
+  }
+
+  function render() {
+    const st = steps[stepIdx];
+    if (!st) return;
+
+    $("stepTitle").textContent = st.title;
+    $("stepDesc").textContent = st.desc;
+    $("codeBox").innerHTML = st.code
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    $("mBd").textContent = blockDim;
+    $("mN").textContent = blockDim * 2;
+    $("mStride").textContent = st.stride;
+    $("mActive").textContent = st.active;
+    $("bar").style.width = `${(stepIdx / (steps.length - 1)) * 100}%`;
+
+    // global grid
+    const gHL = { src: [], dst: [], active: [], dead: [], mode: "sdata" };
+    if (st.hl.globalSrc) {
+      gHL.src = st.hl.src.filter((i) => i < st.input.length);
+    }
+    renderGrid($("globalGrid"), st.input, gHL, "input", blockDim);
+
+    // sdata or val
+    if (st.hl.mode === "val" && st.vals) {
+      const vHL = {
+        src: st.hl.src,
+        dst: st.hl.dst,
+        active: st.hl.active,
+        dead: [],
+        mode: "sdata",
+      };
+      $("sdataGrid").previousElementSibling.textContent =
+        "寄存器 val[tid]（shuffle 阶段，仅示意 warp 内）";
+      renderGrid($("sdataGrid"), st.vals, vHL, "val", blockDim);
+    } else {
+      $("sdataGrid").previousElementSibling.textContent =
+        "Shared sdata[blockDim]";
+      renderGrid($("sdataGrid"), st.sdata, st.hl, "sdata", blockDim);
+    }
+
+    if (st.result) {
+      $("sumBox").hidden = false;
+      $("blockSum").textContent = st.result.got;
+      $("expectSum").textContent = st.result.expect;
+      $("blockSum").style.color =
+        st.result.got === st.result.expect ? "var(--dst)" : "var(--src)";
+    } else {
+      $("sumBox").hidden = true;
+    }
+
+    // phase list
+    const ul = $("phaseList");
+    ul.innerHTML = "";
+    steps.forEach((s, i) => {
+      const li = document.createElement("li");
+      li.textContent = s.title;
+      if (i === stepIdx) li.classList.add("cur");
+      else if (i < stepIdx) li.classList.add("done");
+      li.onclick = () => {
+        stopPlay();
+        stepIdx = i;
+        render();
+      };
+      ul.appendChild(li);
+    });
+
+    $("btnPrev").disabled = stepIdx <= 0;
+    $("btnNext").disabled = stepIdx >= steps.length - 1;
+  }
+
+  function rebuild() {
+    stopPlay();
+    blockDim = parseInt($("mode").value, 10);
+    input = randInput(blockDim * 2);
+    sdata = [];
+    steps = buildSteps(blockDim, input);
+    stepIdx = 0;
+    render();
+  }
+
+  function stopPlay() {
+    if (playTimer) {
+      clearInterval(playTimer);
+      playTimer = null;
+      $("btnPlay").textContent = "自动播放";
+    }
+  }
+
+  $("btnNext").onclick = () => {
+    stopPlay();
+    if (stepIdx < steps.length - 1) {
+      stepIdx++;
+      render();
+    }
+  };
+  $("btnPrev").onclick = () => {
+    stopPlay();
+    if (stepIdx > 0) {
+      stepIdx--;
+      render();
+    }
+  };
+  $("btnReset").onclick = rebuild;
+  $("mode").onchange = rebuild;
+  $("btnPlay").onclick = () => {
+    if (playTimer) {
+      stopPlay();
+      return;
+    }
+    $("btnPlay").textContent = "暂停";
+    playTimer = setInterval(() => {
+      if (stepIdx >= steps.length - 1) {
+        stopPlay();
+        return;
+      }
+      stepIdx++;
+      render();
+    }, 1100);
+  };
+
+  rebuild();
+})();
+</script>
+</body>
+</html>

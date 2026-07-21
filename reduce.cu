@@ -15,119 +15,99 @@ void initializeData(int *data, int n) {
 }
 
 __global__ void reduceDivergent(int *input, int *output, int n) {
+    __shared__ int sdata[256]; // Shared memory for partial sums
+    
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-    int *data = input + blockDim.x + blockIdx.x;
-    if (idx >= n) return;
+    sdata[tid] = (idx < n) ? input[idx] : 0; // Load input into shared memory
+    __syncthreads();
 
     for (int stride = 1; stride < blockDim.x; stride *= 2) {
         if (tid % (2 * stride) == 0) {
-            data[tid] += data[tid + stride];
+            sdata[tid] += sdata[tid + stride];
         }
         __syncthreads();
     }
     if (tid == 0) {
-        output[blockIdx.x] = data[0];
+        output[blockIdx.x] = sdata[0];
     }
 }
 
 __global__ void reduceLessDivergent(int *input, int *output, int n) {
+    __shared__ int sdata[256]; // Shared memory for partial sums
+
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-    int *data = input + blockDim.x + blockIdx.x;
-    if (idx >= n) return;
+    sdata[tid] = (idx < n) ? input[idx] : 0;
+    __syncthreads();
 
     for (int stride = 1; stride < blockDim.x; stride *= 2) {
         int index = 2 * stride * tid;
-        if (index < n) {
-            data[index] += data[index + stride];
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + stride];
         }
         __syncthreads();
     }
     if (tid == 0) {
-        output[blockIdx.x] = data[0];
+        output[blockIdx.x] = sdata[0];
     }
 }
 
 __global__ void reduceInterleaved(int *input, int *output, int n) {
+    __shared__ int sdata[256]; // Shared memory for partial sums
+
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
-    int *data = input + blockDim.x + blockIdx.x;
-    if (idx >= n) return;
+    sdata[tid] = (idx < n) ? input[idx] : 0;
+    __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            data[tid] += data[tid + stride];
+            sdata[tid] += sdata[tid + stride];
         }
         __syncthreads();
     }
     if (tid == 0) {
-        output[blockIdx.x] = data[0];
-    }   
+        output[blockIdx.x] = sdata[0];
+    }
 }
 
 // Shared Memory + Warp Unrolling
 __global__ void reduceWarpUnrolling(int *input, int *output, int n) {
-	unsigned int tid = threadIdx.x;
-	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    __shared__ int sdata[256];
 
-	int *data = input + blockDim.x + blockIdx.x;
-	if (idx >= n) return;
+    unsigned int tid = threadIdx.x;
+    // each block covers 2 * blockDim elements
+    unsigned int idx = blockIdx.x * (blockDim.x * 2) + tid;
 
-	for (int stride = blockDim.x / 2; stride > 32; stride >>= 1) {
-		if (tid < stride) {
-			data[tid] += data[tid + stride];
-		}
-		__syncthreads();
-	}
+    sdata[tid] = (idx < n) ? input[idx] : 0;
+    if (idx + blockDim.x < n) {
+        sdata[tid] += input[idx + blockDim.x];
+    }
+    __syncthreads();
 
-	if (tid < 32) {
-		int val = data[tid];
-		for (int offset = 16; offset > 0; offset >>= 1)	{
-			val += __shfl_down_sync(0xffffffff, val, offset);
-		}
-		if (tid == 0) {
-			data[0] = val;
-		}
-	}
+    // reduce in shared until 64 partials left (sdata[0..63])
+    for (int stride = blockDim.x / 2; stride > 32; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
 
-	if (tid == 0) {
-		output[blockIdx.x] = data[0];
-	}
-} 
-
-__global__ void reduceFinal(const int* input, int* output, int n) {
-	extern __shared__ int sdata[]; // Shared memory for partial sums
-
-	unsigned int tid = threadIdx.x;
-	unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
-	sdata[tid] = (idx < n) ? input[idx] : 0; // Load input into shared memory
-	__syncthreads();
-
-	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-		if (tid < stride) {
-			sdata[tid] += sdata[tid + stride];
-		}
-		__syncthreads();
-	}
-
-	if (tid < 32) {
-		int val = sdata[tid];
-		for (int offset = 16; offset > 0; offset >>= 1) {
-			val += __shfl_down_sync(0xffffffff, val, offset);
-		}
-		if (tid == 0) {
-			sdata[0] = val;
-		}
-	}
-
-	if (tid == 0) {
-		output[blockIdx.x] = sdata[0];
-	}
+    // last warp: fold 64 -> 32, then shuffle 32 -> 1
+    if (tid < 32) {
+        sdata[tid] += sdata[tid + 32];
+        int val = sdata[tid];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (tid == 0) {
+            output[blockIdx.x] = val;
+        }
+    }
 }
 
 int main() {
@@ -175,6 +155,17 @@ int main() {
     cudaEventElapsedTime(&millisecondsInterleaved, start, stop);
 
     printf("Interleaved reduce time: %f ms\n", millisecondsInterleaved);
+
+	cudaEventRecord(start);
+	// 2 loads/thread => half as many blocks
+	reduceWarpUnrolling<<<n / (256 * 2), 256>>>(d_input, d_output, n);
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+
+	float millisecondsWarpUnrolling = 0;
+	cudaEventElapsedTime(&millisecondsWarpUnrolling, start, stop);
+
+	printf("Warp unrolling reduce time: %f ms\n", millisecondsWarpUnrolling);
 
     cudaFree(d_input);
     cudaFree(d_output);
