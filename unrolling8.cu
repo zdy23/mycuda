@@ -50,26 +50,25 @@ __global__ void reduceCompleteUnroll(int *g_idata, int *g_odata,
   }
 }
 
-int cpuReduce(int *data, int size) {
+void gpuReduce(int *d_idata, int *d_odata, unsigned int n,
+               unsigned int blockSize) {
+  unsigned int gridSize = (n + (unsigned long long)blockSize * 8 - 1) /
+                          ((unsigned long long)blockSize * 8);
+
+  reduceCompleteUnroll<256><<<gridSize, blockSize>>>(d_idata, d_odata, n);
+  cudaDeviceSynchronize();
+  if (gridSize > 1) {
+    reduceCompleteUnroll<256><<<1, blockSize>>>(d_odata, d_odata, gridSize);
+    cudaDeviceSynchronize();
+  }
+}
+
+int cpuReduce(int *data, unsigned int size) {
   int sum = 0;
-  for (int i = 0; i < size; i++) {
+  for (unsigned int i = 0; i < size; i++) {
     sum += data[i];
   }
   return sum;
-}
-
-void gpuReduce(int *d_idata, int *d_odata, unsigned int n,
-               int blockSize = 256) {
-  unsigned int gridSize = (n + blockSize * 8 - 1) / (blockSize * 8);
-  while (gridSize > 1) {
-    reduceCompleteUnroll<256><<<gridSize, blockSize>>>(d_idata, d_odata, n);
-    cudaDeviceSynchronize();
-
-    n = gridSize;
-    d_idata = d_odata;
-    gridSize = (gridSize + blockSize * 8 - 1) / (blockSize * 8);
-  }
-  reduceCompleteUnroll<256><<<1, blockSize>>>(d_idata, d_odata, n);
 }
 
 int main() {
@@ -81,7 +80,7 @@ int main() {
 
   srand(time(NULL));
   for (unsigned int i = 0; i < n; i++) {
-    h_idata[i] = rand() % 100;
+    h_idata[i] = 1;
   }
 
   int *d_idata = nullptr;
@@ -108,10 +107,11 @@ int main() {
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
 
-  cudaMemcpy(&gpu_sum, d_odata, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(gpu_sum, d_odata, sizeof(int), cudaMemcpyDeviceToHost);
 
-  int cpu_sum = cpuReduce(h_idata, bytes);
+  int cpu_sum = cpuReduce(h_idata, n);
   printf("CPU sum: %d, GPU sum: %d\n", cpu_sum, *gpu_sum);
+  printf("Match: %s\n", (cpu_sum == *gpu_sum) ? "Yes" : "No");
 
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
