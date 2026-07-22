@@ -1,0 +1,1224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CUDA 嵌套归约 · 递归可视化</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --panel2: #243044;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d9cf0;
+      --accent2: #5eead4;
+      --warn: #fbbf24;
+      --ok: #34d399;
+      --err: #f87171;
+      --code-bg: #0d1117;
+      --thread: #6366f1;
+      --pair-a: #3d9cf0;
+      --pair-b: #a78bfa;
+      --sum: #34d399;
+      --idle: #3a4556;
+      --child: #f59e0b;
+      --shadow: 0 8px 32px rgba(0,0,0,.35);
+      --radius: 12px;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(61,156,240,.12), transparent),
+        radial-gradient(ellipse 60% 40% at 90% 10%, rgba(94,234,212,.08), transparent);
+    }
+
+    header {
+      padding: 1.5rem 2rem 1rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(26,35,50,.6);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    header h1 {
+      font-size: 1.45rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+    }
+
+    header h1 span.badge {
+      font-size: .7rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #0a1628;
+      padding: .2rem .55rem;
+      border-radius: 999px;
+      letter-spacing: 0;
+    }
+
+    header p {
+      color: var(--muted);
+      font-size: .92rem;
+      margin-top: .35rem;
+      max-width: 720px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 1.25rem;
+      padding: 1.25rem 2rem 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; padding: 1rem; }
+      header { padding: 1rem; }
+    }
+
+    .main-col { display: flex; flex-direction: column; gap: 1.25rem; }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .card-hd {
+      padding: .75rem 1.1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      background: var(--panel2);
+    }
+
+    .card-hd h2 {
+      font-size: .95rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: .45rem;
+    }
+
+    .card-hd h2 .num {
+      width: 1.4rem;
+      height: 1.4rem;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-size: .75rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+
+    .card-bd { padding: 1.1rem; }
+
+    /* ---- Idea box ---- */
+    .idea {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: .75rem;
+    }
+    @media (max-width: 700px) { .idea { grid-template-columns: 1fr; } }
+
+    .idea-item {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .85rem;
+    }
+    .idea-item .icon { font-size: 1.4rem; margin-bottom: .3rem; }
+    .idea-item h3 { font-size: .85rem; color: var(--accent2); margin-bottom: .25rem; }
+    .idea-item p { font-size: .8rem; color: var(--muted); }
+
+    /* ---- Controls ---- */
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .6rem;
+      align-items: center;
+    }
+
+    button {
+      font: inherit;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      padding: .5rem 1rem;
+      font-size: .85rem;
+      font-weight: 600;
+      transition: transform .12s, opacity .12s, background .15s;
+    }
+    button:hover:not(:disabled) { transform: translateY(-1px); }
+    button:active:not(:disabled) { transform: translateY(0); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #3d9cf0, #2563eb);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .btn-ok {
+      background: linear-gradient(135deg, #34d399, #059669);
+      color: #052e1c;
+    }
+
+    .step-label {
+      font-size: .8rem;
+      color: var(--muted);
+      margin-left: auto;
+      font-variant-numeric: tabular-nums;
+    }
+    .step-label strong { color: var(--accent2); }
+
+    /* ---- Array cells ---- */
+    .array-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    .array-row {
+      display: flex;
+      gap: .4rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      min-height: 72px;
+      align-items: flex-end;
+    }
+
+    .cell {
+      width: 58px;
+      height: 58px;
+      border-radius: 10px;
+      border: 2px solid var(--border);
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      transition: all .35s cubic-bezier(.4,0,.2,1);
+      font-weight: 700;
+      font-size: 1.05rem;
+    }
+
+    .cell .idx {
+      position: absolute;
+      top: -1.15rem;
+      font-size: .65rem;
+      font-weight: 500;
+      color: var(--muted);
+    }
+
+    .cell .tid-tag {
+      position: absolute;
+      bottom: -1.15rem;
+      font-size: .62rem;
+      font-weight: 600;
+      color: var(--thread);
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity .25s;
+    }
+
+    .cell.active {
+      border-color: var(--pair-a);
+      background: rgba(61,156,240,.15);
+      box-shadow: 0 0 0 3px rgba(61,156,240,.2);
+      transform: scale(1.06);
+    }
+    .cell.partner {
+      border-color: var(--pair-b);
+      background: rgba(167,139,250,.15);
+      box-shadow: 0 0 0 3px rgba(167,139,250,.2);
+    }
+    .cell.written {
+      border-color: var(--sum);
+      background: rgba(52,211,153,.18);
+      box-shadow: 0 0 16px rgba(52,211,153,.25);
+      color: var(--sum);
+    }
+    .cell.dead {
+      opacity: .35;
+      border-style: dashed;
+    }
+    .cell.final {
+      border-color: var(--warn);
+      background: rgba(251,191,36,.2);
+      color: var(--warn);
+      box-shadow: 0 0 20px rgba(251,191,36,.3);
+      transform: scale(1.12);
+    }
+    .cell.show-tid .tid-tag { opacity: 1; }
+
+    .op-arrow {
+      font-size: .75rem;
+      color: var(--muted);
+      text-align: center;
+      min-height: 1.5rem;
+      font-family: ui-monospace, "Cascadia Code", monospace;
+    }
+    .op-arrow.hl { color: var(--accent2); font-weight: 600; }
+
+    /* ---- Recursion tree ---- */
+    .tree {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0;
+      padding: .5rem 0;
+    }
+
+    .tree-level {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+    }
+
+    .tree-node {
+      background: var(--bg);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: .7rem 1.1rem;
+      min-width: 200px;
+      text-align: center;
+      transition: all .35s;
+      position: relative;
+    }
+    .tree-node.current {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(61,156,240,.25), 0 0 24px rgba(61,156,240,.15);
+      background: rgba(61,156,240,.1);
+    }
+    .tree-node.done {
+      border-color: var(--ok);
+      background: rgba(52,211,153,.08);
+    }
+    .tree-node.pending { opacity: .45; }
+
+    .tree-node .depth {
+      font-size: .68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--accent);
+      margin-bottom: .15rem;
+    }
+    .tree-node.done .depth { color: var(--ok); }
+
+    .tree-node .cfg {
+      font-size: .8rem;
+      color: var(--muted);
+      font-family: ui-monospace, monospace;
+    }
+    .tree-node .cfg b { color: var(--text); font-weight: 600; }
+
+    .tree-node .vals {
+      margin-top: .4rem;
+      font-size: .78rem;
+      font-family: ui-monospace, monospace;
+      color: var(--accent2);
+      word-break: break-all;
+    }
+
+    .tree-connector {
+      width: 2px;
+      height: 28px;
+      background: var(--border);
+      position: relative;
+    }
+    .tree-connector::after {
+      content: "▼";
+      position: absolute;
+      bottom: -4px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: .55rem;
+      color: var(--muted);
+    }
+    .tree-connector.live {
+      background: linear-gradient(to bottom, var(--accent), var(--child));
+    }
+
+    .launch-label {
+      font-size: .72rem;
+      color: var(--child);
+      font-weight: 600;
+      margin: .15rem 0;
+      opacity: 0;
+      transition: opacity .3s;
+    }
+    .launch-label.show { opacity: 1; }
+
+    /* ---- Code panel ---- */
+    .code-block {
+      background: var(--code-bg);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+      font-size: .78rem;
+      line-height: 1.55;
+    }
+
+    .code-block pre {
+      padding: .85rem 1rem;
+      overflow-x: auto;
+      margin: 0;
+    }
+
+    .code-line {
+      display: block;
+      padding: 0 .35rem;
+      border-radius: 4px;
+      white-space: pre;
+      color: #c9d1d9;
+    }
+    .code-line .ln {
+      display: inline-block;
+      width: 1.8rem;
+      color: #484f58;
+      user-select: none;
+    }
+    .code-line.hl {
+      background: rgba(61,156,240,.18);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .code-line.hl-base {
+      background: rgba(251,191,36,.15);
+      box-shadow: inset 3px 0 0 var(--warn);
+    }
+    .code-line.hl-launch {
+      background: rgba(245,158,11,.15);
+      box-shadow: inset 3px 0 0 var(--child);
+    }
+    .code-line.hl-add {
+      background: rgba(52,211,153,.12);
+      box-shadow: inset 3px 0 0 var(--ok);
+    }
+
+    .kw { color: #ff7b72; }
+    .fn { color: #d2a8ff; }
+    .ty { color: #79c0ff; }
+    .cm { color: #8b949e; font-style: italic; }
+    .num { color: #79c0ff; }
+    .op { color: #ff7b72; }
+
+    /* ---- Log / narration ---- */
+    .narrate {
+      background: var(--bg);
+      border-left: 3px solid var(--accent);
+      border-radius: 0 8px 8px 0;
+      padding: .75rem 1rem;
+      font-size: .88rem;
+      min-height: 3.2rem;
+    }
+    .narrate .tag {
+      display: inline-block;
+      font-size: .68rem;
+      font-weight: 700;
+      padding: .1rem .45rem;
+      border-radius: 4px;
+      margin-right: .4rem;
+      vertical-align: middle;
+    }
+    .tag-info { background: rgba(61,156,240,.2); color: var(--accent); }
+    .tag-add { background: rgba(52,211,153,.2); color: var(--ok); }
+    .tag-sync { background: rgba(167,139,250,.2); color: #a78bfa; }
+    .tag-launch { background: rgba(245,158,11,.2); color: var(--child); }
+    .tag-base { background: rgba(251,191,36,.2); color: var(--warn); }
+    .tag-done { background: rgba(52,211,153,.25); color: var(--ok); }
+
+    .log-list {
+      max-height: 220px;
+      overflow-y: auto;
+      font-size: .78rem;
+      font-family: ui-monospace, monospace;
+      color: var(--muted);
+    }
+    .log-list .item {
+      padding: .3rem .4rem;
+      border-bottom: 1px solid rgba(45,58,79,.5);
+    }
+    .log-list .item:last-child { border-bottom: none; }
+    .log-list .item.new { color: var(--text); background: rgba(61,156,240,.08); }
+
+    /* ---- Side panel ---- */
+    .side { display: flex; flex-direction: column; gap: 1.25rem; }
+
+    .legend {
+      display: flex;
+      flex-direction: column;
+      gap: .45rem;
+      font-size: .78rem;
+    }
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
+    .swatch {
+      width: 18px;
+      height: 18px;
+      border-radius: 5px;
+      border: 2px solid;
+      flex-shrink: 0;
+    }
+
+    .formula {
+      background: var(--bg);
+      border-radius: 8px;
+      padding: .75rem;
+      font-size: .8rem;
+      font-family: ui-monospace, monospace;
+      border: 1px solid var(--border);
+    }
+    .formula .t { color: var(--accent2); margin-bottom: .35rem; font-weight: 600; }
+    .formula code { color: var(--muted); display: block; margin: .15rem 0; }
+
+    .progress-bar {
+      height: 6px;
+      background: var(--bg);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: .5rem;
+    }
+    .progress-bar > i {
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 999px;
+      width: 0%;
+      transition: width .3s;
+    }
+
+    footer {
+      text-align: center;
+      padding: 1rem 2rem 2rem;
+      color: var(--muted);
+      font-size: .75rem;
+    }
+
+    /* pulse anim for current */
+    @keyframes pulse-ring {
+      0% { box-shadow: 0 0 0 0 rgba(61,156,240,.4); }
+      70% { box-shadow: 0 0 0 10px rgba(61,156,240,0); }
+      100% { box-shadow: 0 0 0 0 rgba(61,156,240,0); }
+    }
+    .cell.active { animation: pulse-ring 1.2s infinite; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      CUDA 嵌套归约（Nested Recursive Reduce）
+      <span class="badge">gpuRecursiveReduce</span>
+    </h1>
+    <p>
+      用「折纸」的方式理解：每次把数组对折相加，减半后再<strong>递归启动子 Kernel</strong>，
+      直到只剩 2 个元素，写出最终和。下方可以逐步播放。
+    </p>
+  </header>
+
+  <div class="layout">
+    <div class="main-col">
+      <!-- 1. 直觉 -->
+      <section class="card">
+        <div class="card-hd">
+          <h2><span class="num">1</span> 一句话直觉</h2>
+        </div>
+        <div class="card-bd">
+          <div class="idea">
+            <div class="idea-item">
+              <div class="icon">📄</div>
+              <h3>对折相加</h3>
+              <p>数组长度 <code>isize</code>，步长 <code>istride = isize/2</code>。前半段每个位置加上后半段对应位置的值。</p>
+            </div>
+            <div class="idea-item">
+              <div class="icon">🔁</div>
+              <h3>线程 0 启动儿子</h3>
+              <p>本层加完后，只有 <code>tid==0</code> 会再 launch 一个更小的 kernel：
+                <code>&lt;&lt;&lt;1, istride&gt;&gt;&gt;</code>，处理半长数组。</p>
+            </div>
+            <div class="idea-item">
+              <div class="icon">🏁</div>
+              <h3>剩 2 个就收工</h3>
+              <p>当 <code>isize == 2</code> 时不再递归，直接
+                <code>*odata = idata[0] + idata[1]</code> 写出结果。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. 交互演示 -->
+      <section class="card">
+        <div class="card-hd">
+          <h2><span class="num">2</span> 逐步演示 · 数组求和过程</h2>
+          <span class="step-label">步骤 <strong id="stepNum">0</strong> / <span id="stepTotal">0</span></span>
+        </div>
+        <div class="card-bd">
+          <div class="controls" style="margin-bottom:1rem">
+            <button class="btn-primary" id="btnPlay" onclick="play()">▶ 自动播放</button>
+            <button class="btn-secondary" id="btnNext" onclick="nextStep()">下一步 →</button>
+            <button class="btn-ghost" id="btnPrev" onclick="prevStep()">← 上一步</button>
+            <button class="btn-ghost" onclick="resetDemo()">重置</button>
+            <label style="font-size:.8rem;color:var(--muted);display:flex;align-items:center;gap:.4rem;margin-left:.5rem">
+              数组大小
+              <select id="sizeSelect" onchange="changeSize()" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:.3rem .5rem">
+                <option value="4">4</option>
+                <option value="8" selected>8</option>
+                <option value="16">16</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="progress-bar"><i id="progressFill"></i></div>
+
+          <div class="narrate" id="narrate" style="margin:1rem 0">
+            <span class="tag tag-info">准备</span>
+            点击「下一步」或「自动播放」，看数组如何被一层层对折求和。
+          </div>
+
+          <div class="array-wrap">
+            <div class="op-arrow" id="opArrow">初始输入数组 g_idata</div>
+            <div class="array-row" id="arrayRow"></div>
+            <div style="margin-top:.8rem;font-size:.78rem;color:var(--muted)" id="odataHint">
+              最终结果将写入 <code>g_odata[block]</code>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. 递归树 -->
+      <section class="card">
+        <div class="card-hd">
+          <h2><span class="num">3</span> 嵌套归约 · 递归调用图</h2>
+        </div>
+        <div class="card-bd">
+          <p style="font-size:.82rem;color:var(--muted);margin-bottom:1rem">
+            每一层是一次 kernel 调用。父 grid 里 <strong>只有线程 0</strong> 负责启动子 grid
+            （Dynamic Parallelism）。箭头表示「谁启动了谁」。
+          </p>
+          <div class="tree" id="tree"></div>
+        </div>
+      </section>
+
+      <!-- 4. 源码高亮 -->
+      <section class="card">
+        <div class="card-hd">
+          <h2><span class="num">4</span> 代码执行对照（当前步骤高亮）</h2>
+        </div>
+        <div class="card-bd">
+          <div class="code-block">
+            <pre id="codeView"></pre>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Side -->
+    <aside class="side">
+      <section class="card">
+        <div class="card-hd"><h2>图例</h2></div>
+        <div class="card-bd legend">
+          <div class="legend-row"><span class="swatch" style="border-color:var(--pair-a);background:rgba(61,156,240,.2)"></span> 当前线程写入的位置（左半）</div>
+          <div class="legend-row"><span class="swatch" style="border-color:var(--pair-b);background:rgba(167,139,250,.2)"></span> 被加进来的伙伴（右半）</div>
+          <div class="legend-row"><span class="swatch" style="border-color:var(--sum);background:rgba(52,211,153,.2)"></span> 刚完成相加的格子</div>
+          <div class="legend-row"><span class="swatch" style="border-color:var(--idle);border-style:dashed;opacity:.5"></span> 本层不再使用的右半段</div>
+          <div class="legend-row"><span class="swatch" style="border-color:var(--warn);background:rgba(251,191,36,.2)"></span> 最终和 odata</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-hd"><h2>核心公式</h2></div>
+        <div class="card-bd">
+          <div class="formula">
+            <div class="t">每层归约</div>
+            <code>istride = isize >> 1   // 除以 2</code>
+            <code>if (tid &lt; istride)</code>
+            <code>  idata[tid] += idata[tid + istride]</code>
+          </div>
+          <div class="formula" style="margin-top:.6rem">
+            <div class="t">递归启动（仅 tid==0）</div>
+            <code>gpuRecursiveReduce</code>
+            <code>  &lt;&lt;&lt;1, istride&gt;&gt;&gt;</code>
+            <code>  (idata, odata, istride);</code>
+          </div>
+          <div class="formula" style="margin-top:.6rem">
+            <div class="t">终止条件</div>
+            <code>if (isize == 2 &amp;&amp; tid == 0)</code>
+            <code>  *odata = idata[0] + idata[1];</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-hd"><h2>执行日志</h2></div>
+        <div class="card-bd">
+          <div class="log-list" id="logList"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-hd"><h2>和普通归约差在哪？</h2></div>
+        <div class="card-bd" style="font-size:.82rem;color:var(--muted)">
+          <p style="margin-bottom:.5rem">
+            <strong style="color:var(--text)">传统归约</strong>：一个 kernel 里用循环
+            <code>for (stride = n/2; …)</code> 在 block 内反复折半，一次 launch 搞定。
+          </p>
+          <p>
+            <strong style="color:var(--text)">嵌套归约</strong>：每一折半都是<strong>新的子 kernel</strong>
+            （Dynamic Parallelism）。父 kernel 的线程 0 当「调度员」，一层层往下派任务，
+            直到 base case。调用关系形成一棵<strong>单链递归树</strong>（每层只有 1 个子调用）。
+          </p>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <footer>
+    基于 gpuRecursiveReduce.cu · 教学可视化 · 数组元素仅为演示用固定样例
+  </footer>
+
+  <script>
+    /* ========== Source lines for highlighting ========== */
+    const CODE_LINES = [
+      { n: 4,  t: '__global__ void gpuRecursiveReduce(int *g_idata, int *g_odata,', c: '' },
+      { n: 5,  t: '                                   unsigned int isize) {', c: '' },
+      { n: 6,  t: '', c: '' },
+      { n: 7,  t: '  // get thread ID', c: 'cm' },
+      { n: 8,  t: '  unsigned int tid = threadIdx.x;', c: '' },
+      { n: 9,  t: '', c: '' },
+      { n: 10, t: '  // get pointer to the input and output data for this block', c: 'cm' },
+      { n: 11, t: '  int *idata = g_idata + blockIdx.x * blockDim.x;', c: '' },
+      { n: 12, t: '  int *odata = &g_odata[blockIdx.x];', c: '' },
+      { n: 13, t: '', c: '' },
+      { n: 14, t: '  // stop condition', c: 'cm' },
+      { n: 15, t: '  if (isize == 2 && tid == 0) {', c: '' },
+      { n: 16, t: '    *odata = idata[0] + idata[1];', c: '' },
+      { n: 17, t: '    return;', c: '' },
+      { n: 18, t: '  }', c: '' },
+      { n: 19, t: '', c: '' },
+      { n: 20, t: '  // nested invocation of the kernel', c: 'cm' },
+      { n: 21, t: '  int istride = isize >> 1;', c: '' },
+      { n: 22, t: '  if (istride > 1 && tid < istride) {', c: '' },
+      { n: 23, t: '    idata[tid] += idata[tid + istride];', c: '' },
+      { n: 24, t: '  }', c: '' },
+      { n: 25, t: '', c: '' },
+      { n: 26, t: '  // sync at block level', c: 'cm' },
+      { n: 27, t: '  __syncthreads();', c: '' },
+      { n: 28, t: '', c: '' },
+      { n: 29, t: '  // nested invocation to generate child grids', c: 'cm' },
+      { n: 30, t: '  if (tid == 0) {', c: '' },
+      { n: 31, t: '    gpuRecursiveReduce<<<1, istride>>>(idata, odata, istride);', c: '' },
+      { n: 32, t: '    __syncthreads();', c: '' },
+      { n: 33, t: '  }', c: '' },
+      { n: 34, t: '  __syncthreads();', c: '' },
+      { n: 35, t: '}', c: '' },
+    ];
+
+    function renderCode(highlightLines, mode) {
+      const pre = document.getElementById('codeView');
+      const set = new Set(highlightLines || []);
+      pre.innerHTML = CODE_LINES.map(L => {
+        let cls = 'code-line';
+        if (set.has(L.n)) {
+          if (mode === 'base') cls += ' hl-base';
+          else if (mode === 'launch') cls += ' hl-launch';
+          else if (mode === 'add') cls += ' hl-add';
+          else cls += ' hl';
+        }
+        let text = L.t
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+        // light syntax: comments
+        if (L.t.trim().startsWith('//')) {
+          text = `<span class="cm">${text}</span>`;
+        } else {
+          text = text
+            .replace(/\b(if|return|unsigned|int|void)\b/g, '<span class="kw">$1</span>')
+            .replace(/\b(gpuRecursiveReduce|__syncthreads|__global__)\b/g, '<span class="fn">$1</span>');
+        }
+        return `<span class="${cls}"><span class="ln">${L.n}</span>${text || ' '}</span>`;
+      }).join('\n');
+    }
+
+    /* ========== Demo state ========== */
+    let N = 8;
+    let initial = [];
+    let steps = [];
+    let stepIndex = 0;
+    let playing = false;
+    let playTimer = null;
+
+    function makeInitial(n) {
+      // 1..n for easy mental math
+      return Array.from({ length: n }, (_, i) => i + 1);
+    }
+
+    /**
+     * Build a list of animation steps by simulating the recursive reduce.
+     * Each step: { type, depth, isize, istride, array, active, partners, written, dead,
+     *              odata, narrate, tag, codeLines, codeMode, log, treeState }
+     */
+    function buildSteps(arr0) {
+      const steps = [];
+      let arr = arr0.slice();
+      const depths = Math.log2(arr0.length); // for tree nodes
+
+      // tree state: list of { depth, isize, threads, status, vals, result? }
+      // status: pending | current | done
+      function treeSnapshot(activeDepth, valsAtDepth, finalResult) {
+        const nodes = [];
+        let size = arr0.length;
+        let d = 0;
+        while (size >= 2) {
+          let status = 'pending';
+          if (d < activeDepth) status = 'done';
+          if (d === activeDepth) status = 'current';
+          if (finalResult !== undefined && d === activeDepth && size === 2) status = 'done';
+          nodes.push({
+            depth: d,
+            isize: size,
+            threads: size, // launched with blockDim = isize in this demo's chain
+            status,
+            vals: valsAtDepth[d] || null,
+            result: (size === 2 && finalResult !== undefined) ? finalResult : null,
+          });
+          size = size >> 1;
+          d++;
+        }
+        return nodes;
+      }
+
+      // Collect vals shown at each depth over time
+      const valsAtDepth = {};
+      valsAtDepth[0] = arr.slice();
+
+      // Step 0: initial
+      steps.push({
+        type: 'init',
+        depth: 0,
+        isize: arr.length,
+        array: arr.slice(),
+        active: [],
+        partners: [],
+        written: [],
+        dead: [],
+        odata: null,
+        narrate: `初始数组长度 isize = ${arr.length}，总和应为 ${arr0.reduce((a,b)=>a+b,0)}。启动根 kernel：<<<1, ${arr.length}>>>`,
+        tag: 'info',
+        tagLabel: '启动',
+        codeLines: [4, 5, 8, 11, 12],
+        codeMode: '',
+        log: `launch root: gpuRecursiveReduce<<<1, ${arr.length}>>>(…, isize=${arr.length})`,
+        tree: treeSnapshot(0, valsAtDepth),
+      });
+
+      // Simulate recursion
+      function simulate(depth, isize) {
+        // base case
+        if (isize === 2) {
+          const sum = arr[0] + arr[1];
+          steps.push({
+            type: 'base',
+            depth,
+            isize: 2,
+            array: arr.slice(),
+            active: [0, 1],
+            partners: [],
+            written: [],
+            dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= 2),
+            odata: null,
+            narrate: `到达终止条件：isize == 2。线程 0 执行 *odata = idata[0] + idata[1] = ${arr[0]} + ${arr[1]} = ${sum}`,
+            tag: 'base',
+            tagLabel: '终止',
+            codeLines: [15, 16, 17],
+            codeMode: 'base',
+            log: `BASE: *odata = ${arr[0]} + ${arr[1]} = ${sum}`,
+            tree: treeSnapshot(depth, valsAtDepth, sum),
+          });
+          steps.push({
+            type: 'done',
+            depth,
+            isize: 2,
+            array: arr.slice(),
+            active: [],
+            partners: [],
+            written: [],
+            dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= 2),
+            odata: sum,
+            narrate: `归约完成！最终结果 ${sum} 已写入 g_odata。整条递归链从 isize=${arr0.length} 一路减半到 2。`,
+            tag: 'done',
+            tagLabel: '完成',
+            codeLines: [16],
+            codeMode: 'base',
+            log: `DONE: sum = ${sum}`,
+            tree: treeSnapshot(depth, valsAtDepth, sum),
+          });
+          return sum;
+        }
+
+        const istride = isize >> 1;
+
+        // Show about to add
+        steps.push({
+          type: 'prepare',
+          depth,
+          isize,
+          istride,
+          array: arr.slice(),
+          active: [],
+          partners: [],
+          written: [],
+          dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= isize),
+          odata: null,
+          narrate: `深度 ${depth}：isize = ${isize}。计算 istride = isize >> 1 = ${istride}。接下来前 ${istride} 个线程各自做一次加法。`,
+          tag: 'info',
+          tagLabel: '本层',
+          codeLines: [21, 22],
+          codeMode: '',
+          log: `depth=${depth} isize=${isize} istride=${istride}`,
+          tree: treeSnapshot(depth, valsAtDepth),
+        });
+
+        // Pair highlight then add, one pair at a time for clarity when N small; for large batch all pairs
+        const pairs = [];
+        for (let tid = 0; tid < istride; tid++) {
+          pairs.push({ tid, left: tid, right: tid + istride });
+        }
+
+        // Highlight all pairs
+        steps.push({
+          type: 'pairs',
+          depth,
+          isize,
+          istride,
+          array: arr.slice(),
+          active: pairs.map(p => p.left),
+          partners: pairs.map(p => p.right),
+          written: [],
+          dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= isize),
+          odata: null,
+          narrate: `并行：每个 tid < ${istride} 的线程执行 idata[tid] += idata[tid + ${istride}]。` +
+            pairs.map(p => ` T${p.tid}: a[${p.left}]+=a[${p.right}]`).join('；'),
+          tag: 'add',
+          tagLabel: '相加',
+          codeLines: [22, 23],
+          codeMode: 'add',
+          log: `parallel add: ${pairs.map(p => `a[${p.left}]+a[${p.right}]`).join(', ')}`,
+          tree: treeSnapshot(depth, valsAtDepth),
+        });
+
+        // Perform adds
+        for (const p of pairs) {
+          arr[p.left] = arr[p.left] + arr[p.right];
+        }
+
+        steps.push({
+          type: 'after_add',
+          depth,
+          isize,
+          istride,
+          array: arr.slice(),
+          active: [],
+          partners: [],
+          written: pairs.map(p => p.left),
+          dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= istride),
+          odata: null,
+          narrate: `相加完成。有效数据收缩到前 ${istride} 格：[${arr.slice(0, istride).join(', ')}]。右半段本层不再需要（虚线）。`,
+          tag: 'add',
+          tagLabel: '写回',
+          codeLines: [23, 27],
+          codeMode: 'add',
+          log: `after add: [${arr.slice(0, istride).join(', ')}] …`,
+          tree: treeSnapshot(depth, valsAtDepth),
+        });
+
+        // Sync
+        steps.push({
+          type: 'sync',
+          depth,
+          isize,
+          istride,
+          array: arr.slice(),
+          active: [],
+          partners: [],
+          written: pairs.map(p => p.left),
+          dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= istride),
+          odata: null,
+          narrate: `__syncthreads()：block 内所有线程对齐，保证上面的加法结果对所有人可见，然后才能安全启动子 kernel。`,
+          tag: 'sync',
+          tagLabel: '同步',
+          codeLines: [27],
+          codeMode: '',
+          log: `__syncthreads() at depth ${depth}`,
+          tree: treeSnapshot(depth, valsAtDepth),
+        });
+
+        // Launch child
+        valsAtDepth[depth + 1] = arr.slice(0, istride);
+        steps.push({
+          type: 'launch',
+          depth,
+          isize,
+          istride,
+          array: arr.slice(),
+          active: [0],
+          partners: [],
+          written: pairs.map(p => p.left),
+          dead: Array.from({ length: arr0.length }, (_, i) => i).filter(i => i >= istride),
+          odata: null,
+          narrate: `线程 0 启动子 kernel：gpuRecursiveReduce<<<1, ${istride}>>>(idata, odata, ${istride})。嵌套归约的「嵌套」就在这里！`,
+          tag: 'launch',
+          tagLabel: '递归',
+          codeLines: [30, 31],
+          codeMode: 'launch',
+          log: `tid0 launch child <<<1, ${istride}>>> isize=${istride}`,
+          tree: treeSnapshot(depth + 1, valsAtDepth),
+          launchChild: true,
+        });
+
+        return simulate(depth + 1, istride);
+      }
+
+      simulate(0, arr.length);
+      return steps;
+    }
+
+    /* ========== Render ========== */
+    function renderArray(step) {
+      const row = document.getElementById('arrayRow');
+      row.innerHTML = '';
+      const arr = step.array;
+      const active = new Set(step.active || []);
+      const partners = new Set(step.partners || []);
+      const written = new Set(step.written || []);
+      const dead = new Set(step.dead || []);
+
+      arr.forEach((v, i) => {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        if (active.has(i)) cell.classList.add('active', 'show-tid');
+        if (partners.has(i)) cell.classList.add('partner', 'show-tid');
+        if (written.has(i)) cell.classList.add('written');
+        if (dead.has(i)) cell.classList.add('dead');
+
+        const idx = document.createElement('span');
+        idx.className = 'idx';
+        idx.textContent = `[${i}]`;
+        cell.appendChild(idx);
+
+        const val = document.createElement('span');
+        val.textContent = v;
+        cell.appendChild(val);
+
+        const tag = document.createElement('span');
+        tag.className = 'tid-tag';
+        if (active.has(i)) tag.textContent = `tid=${i} 写入`;
+        else if (partners.has(i)) tag.textContent = `+ 伙伴`;
+        cell.appendChild(tag);
+
+        row.appendChild(cell);
+      });
+
+      // final odata bubble
+      const hint = document.getElementById('odataHint');
+      if (step.odata !== null && step.odata !== undefined) {
+        hint.innerHTML = `✅ 最终结果 <strong style="color:var(--warn);font-size:1.1rem">${step.odata}</strong> 已写入 <code>g_odata[blockIdx.x]</code>`;
+        // add final cell style on a fake result
+      } else {
+        hint.innerHTML = `最终结果将写入 <code>g_odata[block]</code>`;
+      }
+
+      // op arrow
+      const arrow = document.getElementById('opArrow');
+      if (step.type === 'pairs') {
+        arrow.className = 'op-arrow hl';
+        arrow.textContent = `idata[tid] += idata[tid + ${step.istride}]   （istride = ${step.istride}）`;
+      } else if (step.type === 'after_add') {
+        arrow.className = 'op-arrow hl';
+        arrow.textContent = `前 ${step.istride} 格已更新，有效长度 → ${step.istride}`;
+      } else if (step.type === 'launch') {
+        arrow.className = 'op-arrow hl';
+        arrow.textContent = `tid==0 → 启动子 kernel，isize 变为 ${step.istride}`;
+      } else if (step.type === 'base' || step.type === 'done') {
+        arrow.className = 'op-arrow hl';
+        arrow.textContent = step.type === 'done'
+          ? `*odata = ${step.odata}`
+          : `isize==2，执行终止分支`;
+      } else {
+        arrow.className = 'op-arrow';
+        arrow.textContent = step.type === 'init' ? '初始输入数组 g_idata' : `深度 ${step.depth} · isize = ${step.isize}`;
+      }
+    }
+
+    function renderTree(treeNodes, step) {
+      const el = document.getElementById('tree');
+      if (!treeNodes || !treeNodes.length) {
+        el.innerHTML = '';
+        return;
+      }
+      el.innerHTML = treeNodes.map((node, i) => {
+        const conn = i > 0
+          ? `<div class="tree-connector ${node.status !== 'pending' ? 'live' : ''}"></div>
+             <div class="launch-label ${node.status !== 'pending' ? 'show' : ''}">
+               tid==0 启动 · &lt;&lt;&lt;1, ${node.isize}&gt;&gt;&gt;
+             </div>`
+          : '';
+        const vals = node.vals
+          ? `<div class="vals">[${node.vals.slice(0, node.isize).join(', ')}]</div>`
+          : '';
+        const res = node.result !== null && node.result !== undefined
+          ? `<div class="vals" style="color:var(--warn)">→ odata = ${node.result}</div>`
+          : '';
+        return `
+          ${conn}
+          <div class="tree-level">
+            <div class="tree-node ${node.status}">
+              <div class="depth">深度 ${node.depth}${node.status === 'current' ? ' · 当前' : node.status === 'done' ? ' · 已完成' : ''}</div>
+              <div class="cfg">
+                isize=<b>${node.isize}</b>
+                · grid=&lt;&lt;&lt;1, <b>${node.isize}</b>&gt;&gt;&gt;
+              </div>
+              ${vals}
+              ${res}
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    function renderNarrate(step) {
+      const el = document.getElementById('narrate');
+      const tagMap = {
+        info: 'tag-info', add: 'tag-add', sync: 'tag-sync',
+        launch: 'tag-launch', base: 'tag-base', done: 'tag-done',
+      };
+      el.innerHTML = `<span class="tag ${tagMap[step.tag] || 'tag-info'}">${step.tagLabel || step.tag}</span>${step.narrate}`;
+    }
+
+    function appendLog(text, isNew) {
+      const list = document.getElementById('logList');
+      const item = document.createElement('div');
+      item.className = 'item' + (isNew ? ' new' : '');
+      item.textContent = text;
+      list.appendChild(item);
+      list.scrollTop = list.scrollHeight;
+    }
+
+    function rebuildLogUpTo(idx) {
+      const list = document.getElementById('logList');
+      list.innerHTML = '';
+      for (let i = 0; i <= idx; i++) {
+        if (steps[i].log) {
+          const item = document.createElement('div');
+          item.className = 'item' + (i === idx ? ' new' : '');
+          item.textContent = `[${i}] ${steps[i].log}`;
+          list.appendChild(item);
+        }
+      }
+      list.scrollTop = list.scrollHeight;
+    }
+
+    function showStep(i) {
+      if (i < 0 || i >= steps.length) return;
+      stepIndex = i;
+      const step = steps[i];
+      document.getElementById('stepNum').textContent = i;
+      document.getElementById('stepTotal').textContent = steps.length - 1;
+      document.getElementById('progressFill').style.width =
+        ((i / Math.max(1, steps.length - 1)) * 100) + '%';
+
+      renderArray(step);
+      renderTree(step.tree, step);
+      renderNarrate(step);
+      renderCode(step.codeLines, step.codeMode);
+      rebuildLogUpTo(i);
+
+      document.getElementById('btnPrev').disabled = i <= 0;
+      document.getElementById('btnNext').disabled = i >= steps.length - 1;
+    }
+
+    function nextStep() {
+      if (stepIndex < steps.length - 1) showStep(stepIndex + 1);
+      else stopPlay();
+    }
+    function prevStep() {
+      stopPlay();
+      if (stepIndex > 0) showStep(stepIndex - 1);
+    }
+    function play() {
+      if (playing) {
+        stopPlay();
+        return;
+      }
+      if (stepIndex >= steps.length - 1) showStep(0);
+      playing = true;
+      document.getElementById('btnPlay').textContent = '⏸ 暂停';
+      playTimer = setInterval(() => {
+        if (stepIndex >= steps.length - 1) {
+          stopPlay();
+          return;
+        }
+        nextStep();
+      }, 1600);
+    }
+    function stopPlay() {
+      playing = false;
+      document.getElementById('btnPlay').textContent = '▶ 自动播放';
+      if (playTimer) clearInterval(playTimer);
+      playTimer = null;
+    }
+
+    function resetDemo() {
+      stopPlay();
+      initial = makeInitial(N);
+      steps = buildSteps(initial);
+      showStep(0);
+    }
+
+    function changeSize() {
+      N = parseInt(document.getElementById('sizeSelect').value, 10);
+      resetDemo();
+    }
+
+    // boot
+    renderCode([], '');
+    resetDemo();
+  </script>
+</body>
+</html>
