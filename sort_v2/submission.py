@@ -1,3 +1,6 @@
+#!POPCORN leaderboard sort_v2
+#!POPCORN gpu B200
+
 from task import input_t, output_t
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -5,8 +8,10 @@ from torch.utils.cpp_extension import load_inline
 cpp_src = """
 #include <torch/extension.h>
 
+extern "C" {
 void launch_sort_f32(float*, float*, int);
 void launch_sort_f64(double*, double*, int);
+}
 
 torch::Tensor sort_f32(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
@@ -49,43 +54,59 @@ __device__ __forceinline__ uint32_t get_bucket<double>(double val, int shift) {
   return (uint32_t)((bits ^ mask) >> shift) & 0xFF;
 }
 
-// ---- histogram kernel ----
+// ---- per-block histogram kernel ----
+// Each block computes a local 256-bucket histogram for its chunk of input.
+// Result stored in d_block_hists[blockIdx.x * 256 + bucket].
 template <typename T>
-__global__ void histogram_kernel(const T *__restrict__ input,
-                                 uint32_t *__restrict__ histogram, int n,
-                                 int shift) {
+__global__ void block_histogram_kernel(const T *__restrict__ input,
+                                        uint32_t *__restrict__ block_hists,
+                                        int n, int shift) {
   __shared__ uint32_t local_hist[256];
   for (int i = threadIdx.x; i < 256; i += blockDim.x)
     local_hist[i] = 0;
-
   __syncthreads();
 
-  constexpr int UNROLL = 4;
-  int stride = blockDim.x * gridDim.x * UNROLL;
-  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * UNROLL;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
 
   for (; idx < n; idx += stride) {
-#pragma unroll
-    for (int i = 0; i < UNROLL; ++i) {
-      int cur = idx + i;
-      if (cur < n) {
-        uint32_t bucket = get_bucket(input[cur], shift);
-        atomicAdd(&local_hist[bucket], 1);
-      }
-    }
+    uint32_t bucket = get_bucket(input[idx], shift);
+    atomicAdd(&local_hist[bucket], 1);
   }
-
   __syncthreads();
 
+  // Write block histogram to global memory (one writer per bucket)
   for (int i = threadIdx.x; i < 256; i += blockDim.x)
-    atomicAdd(&histogram[i], local_hist[i]);
+    block_hists[blockIdx.x * 256 + i] = local_hist[i];
 }
 
-// ---- prefix scan kernel ----
+// ---- block-level prefix scan ----
+// For each bucket k (0..255), scan across all blocks to compute
+// the exclusive prefix sum over block histograms.
+// Also outputs the total count per bucket in d_totals.
+// d_hists:  input block histograms (read-only)
+// d_base:   output block base offsets (exclusive sum across blocks)
+// d_totals: output per-bucket total count
+__global__ void block_scan_kernel(const uint32_t *__restrict__ d_hists,
+                                   uint32_t *__restrict__ d_base,
+                                   uint32_t *__restrict__ d_totals,
+                                   int num_blocks) {
+  int bucket = threadIdx.x;  // 0..255
+  uint32_t sum = 0;
+  for (int b = 0; b < num_blocks; b++) {
+    uint32_t cnt = d_hists[b * 256 + bucket];
+    d_base[b * 256 + bucket] = sum;
+    sum += cnt;
+  }
+  d_totals[bucket] = sum;
+}
+
+// ---- global prefix scan ----
+// Computes exclusive prefix sum of a 256-element histogram.
+// Input histogram[tid] = count for bucket tid.
+// Output offsets[tid] = start position for bucket tid.
 __global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
                                    uint32_t *__restrict__ offsets) {
-  constexpr int N = 256;
-
   __shared__ uint32_t warp_sum[8];
 
   const int tid = threadIdx.x;
@@ -128,17 +149,42 @@ __global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
   offsets[tid] = val - histogram[tid];
 }
 
-// ---- scatter kernel ----
+// ---- stable scatter kernel ----
+// Each block processes its chunk of elements in INPUT ORDER (sequentially
+// by thread 0), guaranteeing stability.
+// Output position = global_offsets[bucket] + block_base[bucket] + local_counter.
 template <typename T>
 __global__ void
-scatter_kernel(const T *__restrict__ input, T *__restrict__ output,
-               uint32_t *__restrict__ offsets, int n, int shift) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+stable_scatter_kernel(const T *__restrict__ input, T *__restrict__ output,
+                      const uint32_t *__restrict__ global_offsets,
+                      const uint32_t *__restrict__ block_base,
+                      int n, int shift) {
+  __shared__ uint32_t counters[256];
+  __shared__ T local_in[256];
 
-  if (idx < n) {
-    uint32_t bucket = get_bucket(input[idx], shift);
-    uint32_t pos = atomicAdd(&offsets[bucket], 1);
-    output[pos] = input[idx];
+  // Load counters = global_offsets + block_base
+  for (int i = threadIdx.x; i < 256; i += blockDim.x)
+    counters[i] = global_offsets[i] + block_base[blockIdx.x * 256 + i];
+  __syncthreads();
+
+  // Each thread loads its element into shared memory at threadIdx.x
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n)
+    local_in[threadIdx.x] = input[idx];
+  __syncthreads();
+
+  // Thread 0 processes elements in input order (index 0, 1, 2, ...)
+  if (threadIdx.x == 0) {
+    int end = blockDim.x;
+    int block_start = blockIdx.x * blockDim.x;
+    if (block_start + end > n)
+      end = n - block_start;
+    for (int i = 0; i < end; i++) {
+      T val = local_in[i];
+      uint32_t bucket = get_bucket(val, shift);
+      uint32_t pos = counters[bucket]++;
+      output[pos] = val;
+    }
   }
 }
 
@@ -150,35 +196,54 @@ void radix_sort(T *d_input, T *d_output, int n) {
 
   int blockSize = 256;
   int gridSize = (n + blockSize - 1) / blockSize;
-  int maxGrid;
-  cudaDeviceGetAttribute(&maxGrid, cudaDevAttrMaxGridDimX, 0);
+
+  // Cap grid size to device maximum
+  int maxGrid = 2147483647;
+  cudaError_t err = cudaDeviceGetAttribute(&maxGrid, cudaDevAttrMaxGridDimX, 0);
+  if (err != cudaSuccess) maxGrid = 2147483647;
   if (gridSize > maxGrid) gridSize = maxGrid;
 
-  uint32_t *d_histogram;
-  uint32_t *d_offsets;
+  // Allocate per-block arrays and global histogram/offsets
+  size_t block_array_size = (size_t)gridSize * NUM_BUCKETS * sizeof(uint32_t);
+  uint32_t *d_block_hists;
+  uint32_t *d_block_base;
+  uint32_t *d_global_hist;
+  uint32_t *d_global_offsets;
 
-  cudaMalloc(&d_histogram, NUM_BUCKETS * sizeof(uint32_t));
-  cudaMalloc(&d_offsets, NUM_BUCKETS * sizeof(uint32_t));
+  cudaMalloc(&d_block_hists, block_array_size);
+  cudaMalloc(&d_block_base, block_array_size);
+  cudaMalloc(&d_global_hist, NUM_BUCKETS * sizeof(uint32_t));
+  cudaMalloc(&d_global_offsets, NUM_BUCKETS * sizeof(uint32_t));
 
   T *in = d_input;
   T *out = d_output;
 
   for (int shift = 0; shift < sizeof(T) * 8; shift += BITS_PER_PASS) {
-    cudaMemset(d_histogram, 0, NUM_BUCKETS * sizeof(uint32_t));
+    // 1. Per-block histogram
+    block_histogram_kernel<T><<<gridSize, blockSize>>>(in, d_block_hists, n, shift);
 
-    histogram_kernel<T><<<gridSize, blockSize>>>(in, d_histogram, n, shift);
-    prefix_scan_kernel<<<1, NUM_BUCKETS>>>(d_histogram, d_offsets);
-    scatter_kernel<T><<<gridSize, blockSize>>>(in, out, d_offsets, n, shift);
+    // 2. Block-level scan: compute block_base and per-bucket totals
+    block_scan_kernel<<<1, NUM_BUCKETS>>>(d_block_hists, d_block_base,
+                                           d_global_hist, gridSize);
+
+    // 3. Global prefix scan: compute global_offsets from global_hist
+    prefix_scan_kernel<<<1, NUM_BUCKETS>>>(d_global_hist, d_global_offsets);
+
+    // 4. Stable scatter using global_offsets + block_base
+    stable_scatter_kernel<T><<<gridSize, blockSize>>>(in, out, d_global_offsets,
+                                                       d_block_base, n, shift);
 
     T *tmp = in; in = out; out = tmp;
   }
 
-  cudaFree(d_histogram);
-  cudaFree(d_offsets);
+  cudaFree(d_block_hists);
+  cudaFree(d_block_base);
+  cudaFree(d_global_hist);
+  cudaFree(d_global_offsets);
 
-  // if final result not in d_input, copy back
-  if (in != d_input) {
-    cudaMemcpy(d_input, in, n * sizeof(T), cudaMemcpyDeviceToDevice);
+  // If final result not in d_output, copy to d_output
+  if (in != d_output) {
+    cudaMemcpy(d_output, in, n * sizeof(T), cudaMemcpyDeviceToDevice);
   }
 }
 
@@ -191,6 +256,10 @@ void launch_sort_f64(double *d_input, double *d_output, int n) {
     radix_sort<double>(d_input, d_output, n);
 }
 }
+
+// ---- explicit template instantiations ----
+template void radix_sort<float>(float*, float*, int);
+template void radix_sort<double>(double*, double*, int);
 """
 
 _module = None
@@ -210,10 +279,22 @@ def _get_module():
 
 
 def custom_kernel(data: input_t) -> output_t:
-    mod = _get_module()
-    if data.dtype == torch.float32:
-        return mod.sort_f32(data.contiguous())
-    elif data.dtype == torch.float64:
-        return mod.sort_f64(data.contiguous())
+    # data is a tuple: (input_tensor,) or (input_tensor, output_tensor)
+    if isinstance(data, tuple):
+        input_tensor = data[0]
     else:
-        raise TypeError(f"unsupported dtype: {data.dtype}")
+        input_tensor = data
+
+    mod = _get_module()
+    if input_tensor.dtype == torch.float32:
+        result = mod.sort_f32(input_tensor.contiguous())
+    elif input_tensor.dtype == torch.float64:
+        result = mod.sort_f64(input_tensor.contiguous())
+    else:
+        raise TypeError(f"unsupported dtype: {input_tensor.dtype}")
+
+    # If output buffer was provided in the tuple, copy result into it
+    if isinstance(data, tuple) and len(data) > 1:
+        data[1].copy_(result)
+        return data[1]
+    return result
