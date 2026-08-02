@@ -1,4 +1,7 @@
+#include <__clang_cuda_builtin_vars.h>
 #include <cuda_runtime.h>
+
+const int blockSize = 256;
 
 // Key extraction: bit-level bucket for radix sort
 // float32: flip sign bit so negative values sort before positive
@@ -22,7 +25,7 @@ __device__ __forceinline__ uint32_t get_bucket<double>(double val, int shift) {
 // Kernel to compute the histogram of the input data based on the current shift
 template <typename T>
 __global__ void histogram_kernel(const T *__restrict__ input,
-                                 uint32_t *__restrict__ histogram, int n,
+                                 uint32_t *__restrict__ block_hist, int n,
                                  int shift) {
   __shared__ uint32_t local_hist[256];
   for (int i = threadIdx.x; i < 256; i += blockDim.x)
@@ -49,12 +52,27 @@ __global__ void histogram_kernel(const T *__restrict__ input,
   __syncthreads();
 
   for (int i = threadIdx.x; i < 256; i += blockDim.x)
-    atomicAdd(&histogram[i], local_hist[i]);
+    block_hist[blockIdx.x * 256 + i] = local_hist[i];
 }
 
-// Kernel to perform prefix scan (exclusive) on the histogram to compute offsets
-__global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
-                                   uint32_t *__restrict__ offsets) {
+__global__ void block_scan_kernel(const uint32_t *__restrict__ d_block_hist,
+                                  uint32_t *__restrict__ d_block_base,
+                                  uint32_t *__restrict__ d_totals,
+                                  int num_blocks) {
+  uint32_t sum = 0;
+
+  const int tid = threadIdx.x;
+
+  for (int b = 0; b < num_blocks; b++) {
+    d_block_base[b * blockSize + tid] = sum;
+    sum += d_block_hist[b * 256 + tid];
+  }
+  d_totals[tid] = sum;
+}
+// Kernel to perform prefix scan (exclusive) on the histogram to compute
+// offsets
+__global__ void prefix_scan_kernel(const uint32_t *__restrict__ d_totals,
+                                   uint32_t *__restrict__ d_offsets) {
   constexpr int N = 256;
 
   __shared__ uint32_t warp_sum[8];
@@ -63,7 +81,7 @@ __global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
   const int lane = tid & 31;
   const int warp = tid >> 5;
 
-  uint32_t val = histogram[tid];
+  uint32_t val = d_totals[tid];
 
 // Perform warp-level scan using shuffle instructions
 #pragma unroll
@@ -102,7 +120,7 @@ __global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
     val += warp_sum[warp - 1];
 
   // Inclusive -> Exclusive
-  offsets[tid] = val - histogram[tid];
+  d_offsets[tid] = val - d_totals[tid];
 }
 
 // Kernel to scatter the input data to the output based on the computed offsets
@@ -111,12 +129,12 @@ __global__ void prefix_scan_kernel(const uint32_t *__restrict__ histogram,
 template <typename T>
 __global__ void
 scatter_kernel(const T *__restrict__ input, T *__restrict__ output,
-               uint32_t *__restrict__ offsets, int n, int shift) {
+               uint32_t *__restrict__ d_offsets, int n, int shift) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
     uint32_t bucket = get_bucket(input[idx], shift);
-    uint32_t pos = atomicAdd(&offsets[bucket], 1);
+    uint32_t pos = atomicAdd(&d_offsets[bucket], 1);
     output[pos] = input[idx];
   }
 }
@@ -129,28 +147,33 @@ template <typename T> void radix_sort(T *d_input, T *d_output, int n) {
   int blockSize = 256;
   int gridSize = (n + blockSize - 1) / blockSize;
 
-  uint32_t *d_histogram;
-  uint32_t *d_offsets;
+  uint32_t *d_block_hist, *d_block_base, *d_totals, *d_offsets;
 
-  cudaMalloc(&d_histogram, NUM_BUCKETS * sizeof(uint32_t));
-  cudaMalloc(&d_offsets, NUM_BUCKETS * sizeof(uint32_t));
+  size_t block_array_size = (size_t)gridSize * 256 * sizeof(uint32_t);
+
+  cudaMalloc(&d_block_hist, block_array_size);
+  cudaMalloc(&d_block_base, block_array_size);
+  cudaMalloc(&d_totals, 256 * sizeof(uint32_t));
+  cudaMalloc(&d_offsets, 256 * sizeof(uint32_t));
 
   T *in = d_input;
   T *out = d_output;
 
   for (int shift = 0; shift < sizeof(T) * 8; shift += BITS_PER_PASS) {
-    cudaMemset(d_histogram, 0, NUM_BUCKETS * sizeof(uint32_t));
+    cudaMemset(d_block_hist, 0, block_array_size);
 
-    histogram_kernel<<<gridSize, blockSize>>>(in, d_histogram, n, shift);
+    histogram_kernel<<<gridSize, blockSize>>>(in, d_block_hist, n, shift);
 
-    prefix_scan_kernel<<<1, NUM_BUCKETS>>>(d_histogram, d_offsets);
+    prefix_scan_kernel<<<1, NUM_BUCKETS>>>(d_block_hist, d_offsets);
 
     scatter_kernel<<<gridSize, blockSize>>>(in, out, d_offsets, n, shift);
 
     std::swap(in, out);
   }
 
-  cudaFree(d_histogram);
+  cudaFree(d_block_hist);
+  cudaFree(d_block_base);
+  cudaFree(d_totals);
   cudaFree(d_offsets);
 }
 
