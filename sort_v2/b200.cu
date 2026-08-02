@@ -1,38 +1,3 @@
-#!POPCORN leaderboard sort_v2
-#!POPCORN gpu B200
-
-from task import input_t, output_t
-import torch
-from torch.utils.cpp_extension import load_inline
-
-cpp_src = """
-#include <torch/extension.h>
-
-extern "C" {
-void launch_sort_f32(float*, float*, int);
-void launch_sort_f64(double*, double*, int);
-}
-
-torch::Tensor sort_f32(torch::Tensor input) {
-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    auto output = torch::empty_like(input);
-    launch_sort_f32(input.data_ptr<float>(), output.data_ptr<float>(), input.numel());
-    return output;
-}
-
-torch::Tensor sort_f64(torch::Tensor input) {
-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(input.dtype() == torch::kFloat64, "input must be float64");
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    auto output = torch::empty_like(input);
-    launch_sort_f64(input.data_ptr<double>(), output.data_ptr<double>(), input.numel());
-    return output;
-}
-"""
-
-cuda_src = """
 #include <cuda_runtime.h>
 #include <stdint.h>
 
@@ -173,11 +138,13 @@ scatter_kernel(const T *__restrict__ input, T *__restrict__ output,
 
   for (int d = 1; d < 256; d <<= 1) {
     int idx = (tid + 1) * 2 * d - 1;
-    if (idx < 256) scan[idx] += scan[idx - d];
+    if (idx < 256)
+      scan[idx] += scan[idx - d];
     __syncthreads();
   }
 
-  if (tid == 0) scan[255] = 0;
+  if (tid == 0)
+    scan[255] = 0;
   __syncthreads();
 
   for (int d = 128; d > 0; d >>= 1) {
@@ -196,7 +163,8 @@ scatter_kernel(const T *__restrict__ input, T *__restrict__ output,
   if (gid < n) {
     uint32_t b = local_bucket[tid];
     uint32_t pos = atomicAdd(&hist[b], 1);
-    output[d_offsets[b] + d_block_base[blockIdx.x * 256 + b] + pos] = local_in[tid];
+    output[d_offsets[b] + d_block_base[blockIdx.x * 256 + b] + pos] =
+        local_in[tid];
   }
 }
 
@@ -250,45 +218,98 @@ template <typename T> void radix_sort(T *d_input, T *d_output, int n) {
 template void radix_sort<float>(float *, float *, int);
 template void radix_sort<double>(double *, double *, int);
 
-extern "C" {
-void launch_sort_f32(float *in, float *out, int n) { radix_sort<float>(in, out, n); }
-void launch_sort_f64(double *in, double *out, int n) { radix_sort<double>(in, out, n); }
+// ---- test harness -----------------------------------------------------------
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = call;                                                    \
+    if (err != cudaSuccess) {                                                  \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,            \
+              cudaGetErrorString(err));                                        \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+template <typename T> bool verify(const T *data, int n) {
+  for (int i = 0; i < n - 1; i++) {
+    if (data[i] > data[i + 1])
+      return false;
+  }
+  return true;
 }
-"""
 
-_module = None
+template <typename T> void run_test(int n) {
+  T *h_input = new T[n];
+  T *h_output = new T[n];
+  T *h_expected = new T[n];
 
-def _get_module():
-    global _module
-    if _module is None:
-        _module = load_inline(
-            name="radix_sort_op",
-            cpp_sources=[cpp_src],
-            cuda_sources=[cuda_src],
-            functions=["sort_f32", "sort_f64"],
-            verbose=False,
-            extra_cuda_cflags=["-O3"],
-        )
-    return _module
+  // Generate random data including negatives
+  srand(42);
+  for (int i = 0; i < n; i++) {
+    if constexpr (std::is_same_v<T, float>)
+      h_input[i] = (float)(rand() % 1000000 - 500000) / 1000.0f;
+    else
+      h_input[i] = (double)(rand() % 1000000 - 500000) / 1000.0;
+  }
 
+  // CPU reference
+  std::copy(h_input, h_input + n, h_expected);
+  std::sort(h_expected, h_expected + n);
 
-def custom_kernel(data: input_t) -> output_t:
-    # data is a tuple: (input_tensor,) or (input_tensor, output_tensor)
-    if isinstance(data, tuple):
-        input_tensor = data[0]
-    else:
-        input_tensor = data
+  // GPU sort
+  T *d_input, *d_output;
+  CUDA_CHECK(cudaMalloc(&d_input, n * sizeof(T)));
+  CUDA_CHECK(cudaMalloc(&d_output, n * sizeof(T)));
+  CUDA_CHECK(
+      cudaMemcpy(d_input, h_input, n * sizeof(T), cudaMemcpyHostToDevice));
 
-    mod = _get_module()
-    if input_tensor.dtype == torch.float32:
-        result = mod.sort_f32(input_tensor.contiguous())
-    elif input_tensor.dtype == torch.float64:
-        result = mod.sort_f64(input_tensor.contiguous())
-    else:
-        raise TypeError(f"unsupported dtype: {input_tensor.dtype}")
+  // Warm up
+  radix_sort<T>(d_input, d_output, n);
+  CUDA_CHECK(cudaDeviceSynchronize());
 
-    # If output buffer was provided in the tuple, copy result into it
-    if isinstance(data, tuple) and len(data) > 1:
-        data[1].copy_(result)
-        return data[1]
-    return result
+  // Timed run
+  CUDA_CHECK(
+      cudaMemcpy(d_input, h_input, n * sizeof(T), cudaMemcpyHostToDevice));
+  auto start = std::chrono::high_resolution_clock::now();
+  radix_sort<T>(d_input, d_output, n);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  auto end = std::chrono::high_resolution_clock::now();
+
+  double ms = std::chrono::duration<double, std::milli>(end - start).count();
+  CUDA_CHECK(
+      cudaMemcpy(h_output, d_output, n * sizeof(T), cudaMemcpyDeviceToHost));
+
+  bool ok = true;
+  for (int i = 0; i < n; i++) {
+    if (h_output[i] != h_expected[i]) {
+      ok = false;
+      printf("MISMATCH at [%d]: got %g, expected %g\n", i, (double)h_output[i],
+             (double)h_expected[i]);
+      break;
+    }
+  }
+
+  const char *tname = std::is_same_v<T, float> ? "float32" : "float64";
+  printf("[%s] n=%d   %s   %.3f ms\n", tname, n, ok ? "PASS" : "FAIL", ms);
+
+  CUDA_CHECK(cudaFree(d_input));
+  CUDA_CHECK(cudaFree(d_output));
+  delete[] h_input;
+  delete[] h_output;
+  delete[] h_expected;
+}
+
+// Quick debug: check first pass only
+int main() {
+  int sizes[] = {1000, 10000, 100000, 1000000, 10000000};
+  for (int n : sizes) {
+    run_test<float>(n);
+    run_test<double>(n);
+  }
+  printf("\nDone.\n");
+  return 0;
+}
