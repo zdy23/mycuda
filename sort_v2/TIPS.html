@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>B200 算子优化心得 · sort_v2</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg2: #121a32;
+    --card: #151d36;
+    --line: #2a365c;
+    --text: #e8eefc;
+    --muted: #9aabd0;
+    --accent: #5b8cff;
+    --accent2: #37d6c5;
+    --warn: #ffb020;
+    --danger: #ff5d6c;
+    --ok: #3dd68c;
+    --pink: #c084fc;
+    --shadow: 0 12px 40px rgba(0,0,0,.35);
+    --radius: 16px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(91,140,255,.18), transparent 50%),
+      radial-gradient(900px 500px at 90% 0%, rgba(55,214,197,.12), transparent 45%),
+      var(--bg);
+    color: var(--text);
+    line-height: 1.65;
+  }
+
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 20px 80px; }
+
+  /* Hero */
+  .hero {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    background: linear-gradient(145deg, #17213f 0%, #10182d 55%, #0e1630 100%);
+    box-shadow: var(--shadow);
+    padding: 40px 36px 32px;
+    margin-bottom: 28px;
+  }
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: -40% auto auto 55%;
+    width: 420px; height: 420px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(91,140,255,.25), transparent 65%);
+    animation: floaty 8s ease-in-out infinite;
+  }
+  @keyframes floaty {
+    0%,100% { transform: translateY(0); }
+    50% { transform: translateY(18px); }
+  }
+  .badge-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; letter-spacing: .02em;
+    padding: 5px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: rgba(255,255,255,.04);
+    color: var(--muted);
+  }
+  .badge.ok { color: var(--ok); border-color: rgba(61,214,140,.35); background: rgba(61,214,140,.08); }
+  .badge.warn { color: var(--warn); border-color: rgba(255,176,32,.35); background: rgba(255,176,32,.08); }
+  .badge.accent { color: var(--accent); border-color: rgba(91,140,255,.4); background: rgba(91,140,255,.1); }
+
+  h1 {
+    margin: 0 0 12px;
+    font-size: clamp(1.7rem, 3.2vw, 2.35rem);
+    line-height: 1.2;
+    letter-spacing: -.02em;
+  }
+  .hero-lead { color: var(--muted); max-width: 62ch; margin: 0 0 22px; font-size: 1.05rem; }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    position: relative;
+    z-index: 1;
+  }
+  .stat {
+    background: rgba(0,0,0,.22);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 16px;
+  }
+  .stat b { display: block; font-size: 1.25rem; color: var(--accent2); }
+  .stat span { color: var(--muted); font-size: .86rem; }
+
+  /* Nav */
+  nav.toc {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(12px);
+    background: rgba(11,16,32,.82);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 10px 12px;
+    margin-bottom: 28px;
+    display: flex; flex-wrap: wrap; gap: 6px;
+  }
+  nav.toc a {
+    color: var(--muted);
+    font-size: .84rem;
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+  }
+  nav.toc a:hover {
+    color: var(--text);
+    background: rgba(91,140,255,.12);
+    border-color: rgba(91,140,255,.25);
+    text-decoration: none;
+  }
+
+  section {
+    margin-bottom: 36px;
+    scroll-margin-top: 72px;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 0 0 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2 .num {
+    width: 32px; height: 32px; border-radius: 10px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), #7c5cff);
+    font-size: .9rem; font-weight: 700;
+  }
+  h3 { margin: 22px 0 10px; font-size: 1.08rem; color: #c9d7ff; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px 22px;
+    box-shadow: var(--shadow);
+    margin-bottom: 14px;
+  }
+  .card p:first-child { margin-top: 0; }
+  .card p:last-child { margin-bottom: 0; }
+  .muted { color: var(--muted); }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+
+  /* Callouts */
+  .callout {
+    border-radius: 14px;
+    padding: 14px 16px;
+    border: 1px solid;
+    margin: 12px 0;
+  }
+  .callout.tip { border-color: rgba(55,214,197,.35); background: rgba(55,214,197,.08); }
+  .callout.warn { border-color: rgba(255,176,32,.4); background: rgba(255,176,32,.08); }
+  .callout.danger { border-color: rgba(255,93,108,.4); background: rgba(255,93,108,.08); }
+  .callout.ok { border-color: rgba(61,214,140,.35); background: rgba(61,214,140,.08); }
+  .callout strong { display: block; margin-bottom: 4px; }
+
+  code, .mono { font-family: var(--mono); font-size: .9em; }
+  pre {
+    font-family: var(--mono);
+    font-size: .82rem;
+    background: #0a0f1d;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    line-height: 1.5;
+    color: #d7e3ff;
+  }
+  pre .kw { color: #c084fc; }
+  pre .fn { color: #5b8cff; }
+  pre .str { color: #3dd68c; }
+  pre .cm { color: #6b7a9e; }
+  pre .num { color: #ffb020; }
+
+  /* Timeline */
+  .timeline { position: relative; padding-left: 22px; }
+  .timeline::before {
+    content: "";
+    position: absolute; left: 7px; top: 6px; bottom: 6px;
+    width: 2px; background: linear-gradient(var(--accent), var(--accent2));
+  }
+  .tl-item { position: relative; margin-bottom: 16px; padding-left: 16px; }
+  .tl-item::before {
+    content: "";
+    position: absolute; left: -19px; top: 8px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 4px rgba(91,140,255,.2);
+  }
+  .tl-item.fail::before { background: var(--danger); box-shadow: 0 0 0 4px rgba(255,93,108,.2); }
+  .tl-item.ok::before { background: var(--ok); box-shadow: 0 0 0 4px rgba(61,214,140,.2); }
+  .tl-item h4 { margin: 0 0 4px; font-size: .98rem; }
+  .tl-item p { margin: 0; color: var(--muted); font-size: .92rem; }
+
+  /* Pipeline animation */
+  .pipeline {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    justify-content: center; padding: 8px 0 4px;
+  }
+  .pipe-stage {
+    min-width: 110px;
+    text-align: center;
+    padding: 12px 10px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: #0f162c;
+    transition: transform .25s, border-color .25s, box-shadow .25s;
+  }
+  .pipe-stage.active {
+    border-color: var(--accent2);
+    box-shadow: 0 0 0 3px rgba(55,214,197,.18), 0 8px 24px rgba(55,214,197,.15);
+    transform: translateY(-3px);
+  }
+  .pipe-stage .ico { font-size: 1.35rem; display: block; margin-bottom: 4px; }
+  .pipe-stage .lab { font-size: .78rem; color: var(--muted); }
+  .pipe-stage .name { font-weight: 700; font-size: .92rem; }
+  .pipe-arrow {
+    color: var(--muted); font-size: 1.2rem;
+    animation: pulse-arrow 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse-arrow {
+    0%,100% { opacity: .35; transform: translateX(0); }
+    50% { opacity: 1; transform: translateX(3px); }
+  }
+
+  /* Bit flip demo */
+  .bits {
+    display: flex; flex-wrap: wrap; gap: 4px; justify-content: center;
+    margin: 12px 0;
+  }
+  .bit {
+    width: 28px; height: 36px;
+    border-radius: 6px;
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: .85rem; font-weight: 700;
+    border: 1px solid var(--line);
+    background: #0d1428;
+    transition: background .35s, color .35s, transform .35s, border-color .35s;
+  }
+  .bit.on { background: rgba(91,140,255,.25); border-color: var(--accent); color: #cfe0ff; }
+  .bit.flip {
+    background: rgba(255,176,32,.28);
+    border-color: var(--warn);
+    color: #ffe6b0;
+    transform: scale(1.08);
+  }
+  .bit.bucket {
+    background: rgba(61,214,140,.22);
+    border-color: var(--ok);
+  }
+
+  /* Scatter board */
+  .board {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 6px;
+    margin: 10px 0;
+  }
+  .cell {
+    aspect-ratio: 1;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: #0d1428;
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: .72rem;
+    color: var(--muted);
+    transition: all .45s ease;
+  }
+  .cell.filled {
+    color: #0b1020;
+    font-weight: 700;
+    border-color: transparent;
+  }
+
+  /* Compare cards */
+  .vs {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 10px;
+    align-items: stretch;
+  }
+  @media (max-width: 720px) {
+    .vs { grid-template-columns: 1fr; }
+    .vs .mid { display: none; }
+  }
+  .vs .side {
+    border-radius: 14px; padding: 14px;
+    border: 1px solid var(--line);
+  }
+  .vs .bad { background: rgba(255,93,108,.08); border-color: rgba(255,93,108,.35); }
+  .vs .good { background: rgba(61,214,140,.08); border-color: rgba(61,214,140,.35); }
+  .vs .mid {
+    display: grid; place-items: center;
+    font-weight: 800; color: var(--muted);
+  }
+  .vs h4 { margin: 0 0 8px; }
+  .vs ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: .92rem; }
+
+  /* Checklist */
+  .check-list { list-style: none; padding: 0; margin: 0; }
+  .check-list li {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 10px 0;
+    border-bottom: 1px dashed rgba(42,54,92,.8);
+  }
+  .check-list li:last-child { border-bottom: 0; }
+  .check-list .mark {
+    flex: 0 0 auto;
+    width: 22px; height: 22px; border-radius: 6px;
+    display: grid; place-items: center;
+    font-size: .75rem; font-weight: 800;
+  }
+  .mark.do { background: rgba(61,214,140,.2); color: var(--ok); }
+  .mark.dont { background: rgba(255,93,108,.2); color: var(--danger); }
+
+  /* Arch chips animation */
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .chip {
+    padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--line);
+    background: #0f162c;
+    font-size: .82rem; color: var(--muted);
+  }
+  .chip.hl {
+    animation: chip-glow 2.4s ease-in-out infinite;
+    border-color: rgba(91,140,255,.55);
+    color: #d7e5ff;
+    background: rgba(91,140,255,.12);
+  }
+  @keyframes chip-glow {
+    0%,100% { box-shadow: 0 0 0 0 rgba(91,140,255,0); }
+    50% { box-shadow: 0 0 0 6px rgba(91,140,255,.12); }
+  }
+
+  /* Interactive controls */
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    margin: 10px 0 6px;
+  }
+  button {
+    appearance: none; border: 1px solid var(--line);
+    background: linear-gradient(180deg, #1c2748, #151d36);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform .15s, border-color .15s;
+  }
+  button:hover { border-color: var(--accent); transform: translateY(-1px); }
+  button.primary {
+    background: linear-gradient(135deg, #3d6dff, #5b8cff);
+    border-color: transparent;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+  /* Progress bar for radix pass */
+  .pass-bar {
+    height: 8px; border-radius: 999px;
+    background: #0a0f1d; border: 1px solid var(--line);
+    overflow: hidden; margin: 8px 0 4px;
+  }
+  .pass-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .4s ease;
+  }
+
+  /* GPU diagram */
+  .gpu {
+    position: relative;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, #18233f, #10182c);
+    padding: 18px;
+    overflow: hidden;
+  }
+  .gpu-title { font-weight: 700; margin-bottom: 10px; }
+  .sm-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 6px;
+  }
+  .sm {
+    height: 34px; border-radius: 6px;
+    background: #0c1326;
+    border: 1px solid #243056;
+    position: relative; overflow: hidden;
+  }
+  .sm::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(55,214,197,.45), transparent);
+    transform: translateX(-100%);
+  }
+  .gpu.running .sm::after {
+    animation: sm-scan 2.2s linear infinite;
+  }
+  .gpu.running .sm:nth-child(odd)::after { animation-delay: .15s; }
+  .gpu.running .sm:nth-child(3n)::after { animation-delay: .35s; }
+  @keyframes sm-scan {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+  .hbm {
+    margin-top: 12px;
+    height: 28px; border-radius: 8px;
+    border: 1px dashed rgba(192,132,252,.45);
+    background: rgba(192,132,252,.08);
+    display: grid; place-items: center;
+    font-size: .8rem; color: #e0c6ff;
+    position: relative; overflow: hidden;
+  }
+  .hbm .flow {
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(192,132,252,.35), transparent);
+    animation: hbm-flow 2s linear infinite;
+  }
+  @keyframes hbm-flow {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(100%); }
+  }
+
+  footer {
+    margin-top: 40px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: .88rem;
+    text-align: center;
+  }
+
+  /* Floating legend dots */
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align: middle; }
+  .dot.a { background: var(--accent); }
+  .dot.b { background: var(--accent2); }
+  .dot.c { background: var(--warn); }
+  .dot.d { background: var(--ok); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ================= HERO ================= -->
+  <header class="hero">
+    <div class="badge-row">
+      <span class="badge accent">GPU MODE · sort_v2</span>
+      <span class="badge ok">B200 · sm_100</span>
+      <span class="badge warn">实战排雷笔记</span>
+      <span class="badge">submission.py</span>
+    </div>
+    <h1>在 B200 上做算子优化的心得</h1>
+    <p class="hero-lead">
+      围绕 <code>sort_v2/submission.py</code> 的完整踩坑路径：从 TMA 幻想、
+      <code>load_inline</code> 编译地狱，到可运行的 standalone nvcc + ctypes +
+      8-bit radix sort。这份笔记把「为什么错」和「怎么对」用图和动画讲清楚。
+    </p>
+    <div class="hero-grid">
+      <div class="stat"><b>sm_100</b><span>B200 / Blackwell</span></div>
+      <div class="stat"><b>8-bit</b><span>radix pass 宽度</span></div>
+      <div class="stat"><b>4 / 8</b><span>f32 / f64 passes</span></div>
+      <div class="stat"><b>ctypes</b><span>绕开 load_inline</span></div>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <a href="#s1">1. 总览</a>
+    <a href="#s2">2. 踩坑时间线</a>
+    <a href="#s3">3. 编译与部署</a>
+    <a href="#s4">4. Radix 流水线</a>
+    <a href="#s5">5. Float 比特序</a>
+    <a href="#s6">6. 稳定 Scatter</a>
+    <a href="#s7">7. TMA 陷阱</a>
+    <a href="#s8">8. B200 Checklist</a>
+    <a href="#s9">9. 下一步优化</a>
+  </nav>
+
+  <!-- ================= 1 ================= -->
+  <section id="s1">
+    <h2><span class="num">1</span> 总览：算子在 B200 上活下来的三层</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="margin-top:0">① 能编过 · Build</h3>
+        <p class="muted">评测镜像的工具链 ≠ 你本机。PyTorch JIT extension、C++ 标准、arch flag 任何一个不对，连 kernel 都启动不了。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">② 算得对 · Correctness</h3>
+        <p class="muted">float 符号位、稳定排序、不破坏 input、边界 <code>n=0</code>、末 block 的 shfl 全员参与……正确性是性能优化的门票。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">③ 跑得快 · Performance</h3>
+        <p class="muted">B200 带宽巨大，sort 常是 memory-bound。先保证 histogram / scan / scatter 结构正确，再谈 TMA、onesweep、CUB。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">核心结论</h3>
+        <p class="muted">这次 sort_v2 的「胜利条件」首先是<strong>评测机能编译并给出正确结果</strong>。fancy API（TMA experimental）在工具链不匹配时反而全盘皆输。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="gpu" id="gpuDemo">
+        <div class="gpu-title">🎬 B200 心智模型（示意）</div>
+        <div class="sm-grid" id="smGrid"></div>
+        <div class="hbm"><span class="flow"></span>HBM3e · 超高带宽 · sort 多为 memory-bound</div>
+        <div class="controls">
+          <button class="primary" id="btnGpuRun">运行 kernel 动画</button>
+          <button id="btnGpuStop">暂停</button>
+          <span class="muted" style="font-size:.85rem">绿色扫描线 ≈ SM 在吐吞吐；紫色条 ≈ HBM 流量</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 2 ================= -->
+  <section id="s2">
+    <h2><span class="num">2</span> 踩坑时间线（真实路径）</h2>
+    <div class="card">
+      <div class="timeline">
+        <div class="tl-item fail">
+          <h4>❌ v1 · TMA + load_inline + sm_90a</h4>
+          <p>Hopper 味道的 TMA（boxDim&gt;256、SWIZZLE_128B、barrier init=1、缺 expect_tx），再叠加错误 arch。正确性与可编译性双杀。</p>
+        </div>
+        <div class="tl-item fail">
+          <h4>❌ v2 · 修 TMA 约束后仍 load_inline</h4>
+          <p>CUDA 13.3 上 experimental TMA API 弃用警告；更致命的是 torch 头文件被带进 <code>.cu</code>，触发 <code>List_inl.h</code> 编译错误。</p>
+        </div>
+        <div class="tl-item fail">
+          <h4>❌ v3 · 改 CUB + load_inline</h4>
+          <p>内核换成 CUB 仍失败——说明锅在 <strong>load_inline 的 nvcc 命令行</strong>（torch isystem + c++17），不在排序算法本身。</p>
+        </div>
+        <div class="tl-item ok">
+          <h4>✅ v4 · standalone nvcc → .so + ctypes</h4>
+          <p>彻底不让 torch 参与 CUDA 编译。手写 8-bit radix，scratch ping-pong 不破坏 input，sm_100。评测通过。</p>
+        </div>
+      </div>
+      <div class="callout tip">
+        <strong>💡 TIP · 分层排错</strong>
+        先问「能不能编过」，再问「结果对不对」，最后才问「够不够快」。把编译问题当成算法问题，会浪费整晚。
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 3 ================= -->
+  <section id="s3">
+    <h2><span class="num">3</span> 编译与部署：B200 评测机生存指南</h2>
+
+    <div class="vs">
+      <div class="side bad">
+        <h4>💣 雷区 · load_inline</h4>
+        <ul>
+          <li><code>main.cpp</code>：-std=c++20 ✅</li>
+          <li><code>cuda.cu</code>：-std=c++17 + torch -isystem ❌</li>
+          <li>触发 ATen <code>List_inl.h</code> dependent-scope error</li>
+          <li>与你写不写 TMA / CUB 无关</li>
+        </ul>
+      </div>
+      <div class="mid">→</div>
+      <div class="side good">
+        <h4>🛡️ 安全区 · standalone</h4>
+        <ul>
+          <li><code>nvcc -shared -Xcompiler -fPIC</code></li>
+          <li>零 torch headers</li>
+          <li><code>-gencode=arch=compute_100,code=sm_100</code></li>
+          <li>Python <code>ctypes.CDLL</code> 调 <code>extern "C"</code></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3 style="margin-top:0">推荐构建骨架（与 submission.py 一致）</h3>
+<pre><span class="cm"># 1) 写出纯 CUDA 源（无 torch）</span>
+<span class="cm"># 2) 编译共享库</span>
+nvcc -shared -Xcompiler -fPIC -O3 -std=c++17 \
+  -gencode=arch=compute_100,code=sm_100 \
+  -gencode=arch=compute_100,code=compute_100 \
+  sort.cu -o libsort.so
+
+<span class="cm"># 3) Python 侧</span>
+lib = ctypes.CDLL(<span class="str">"libsort.so"</span>)
+lib.launch_sort_f32.argtypes = [c_void_p, c_void_p, c_int]
+lib.launch_sort_f32(c_void_p(x.data_ptr()), c_void_p(y.data_ptr()), n)
+torch.cuda.synchronize()  <span class="cm"># 正确性检查前记得 sync</span></pre>
+      <div class="callout warn">
+        <strong>⚠️ Arch 对照</strong>
+        B200 = <strong>compute capability 10.0 → sm_100</strong>。
+        <code>sm_90a</code> 是 Hopper，在 B200 上要么跑不了要么行为诡异。
+        提交 leaderboard 时写对 <code>#!POPCORN gpu B200</code> 和 gencode。
+      </div>
+      <div class="chip-row">
+        <span class="chip">H100 → sm_90</span>
+        <span class="chip hl">B200 → sm_100</span>
+        <span class="chip">A100 → sm_80</span>
+        <span class="chip">L4 → sm_89</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">缓存与可复现</h3>
+      <p class="muted">submission.py 用 CUDA 源的 SHA1 前缀命名 <code>.cu</code> / <code>.so</code>：源变了自动重编，源不变秒加载。评测多次调用 <code>custom_kernel</code> 时只付一次编译成本。</p>
+<pre>src_hash = sha1(CUDA_SRC)[:12]
+so_path  = build / f<span class="str">"libsort_{src_hash}.so"</span>
+<span class="kw">if not</span> so_path.is_file():
+    nvcc ... -o so_path</pre>
+    </div>
+  </section>
+
+  <!-- ================= 4 ================= -->
+  <section id="s4">
+    <h2><span class="num">4</span> Radix Sort 流水线（动画）</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">
+        每一 pass 处理 8 bit（256 buckets）。float32 共 4 pass，float64 共 8 pass。
+        每 pass 四步：<span class="dot a"></span>Histogram →
+        <span class="dot b"></span>Block Scan →
+        <span class="dot c"></span>Prefix →
+        <span class="dot d"></span>Scatter。
+      </p>
+
+      <div class="pipeline" id="pipeline">
+        <div class="pipe-stage" data-i="0">
+          <span class="ico">📊</span>
+          <div class="name">Histogram</div>
+          <div class="lab">per-block 计数</div>
+        </div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-stage" data-i="1">
+          <span class="ico">📶</span>
+          <div class="name">Block Scan</div>
+          <div class="lab">跨 block 基址</div>
+        </div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-stage" data-i="2">
+          <span class="ico">➕</span>
+          <div class="name">Prefix</div>
+          <div class="lab">bucket 全局偏移</div>
+        </div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-stage" data-i="3">
+          <span class="ico">🎯</span>
+          <div class="name">Scatter</div>
+          <div class="lab">稳定写回</div>
+        </div>
+      </div>
+
+      <div class="pass-bar"><div class="pass-fill" id="passFill"></div></div>
+      <div class="controls">
+        <button class="primary" id="btnPipePlay">播放 4-pass (f32)</button>
+        <button id="btnPipeStep">单步</button>
+        <button id="btnPipeReset">重置</button>
+        <span class="muted" id="pipeStatus" style="font-size:.88rem">待命 · pass 0 / 4</span>
+      </div>
+
+      <h3>数据流：不破坏 input 的 ping-pong</h3>
+      <pre><span class="cm">// Pass 0:  input  → output</span>
+<span class="cm">// Pass 1:  output → scratch</span>
+<span class="cm">// Pass 2:  scratch → output</span>
+<span class="cm">// Pass 3:  output → scratch</span>
+<span class="cm">// 若最终结果在 scratch，再 D2D copy 到 output</span>
+<span class="kw">const</span> T *in = d_input;
+T *out = d_output;
+<span class="kw">for</span> (pass ...) {
+  hist / scan / scatter(in → out);
+  in = out;
+  out = (out == d_output) ? d_scratch : d_output;
+}</pre>
+      <div class="callout ok">
+        <strong>✅ 为什么必须 scratch？</strong>
+        若用 input 当第二缓冲，会<strong>原地改写调用方 tensor</strong>。
+        <code>x.contiguous()</code> 在已连续时不会拷贝，直接把用户数据当 scratch——正确性测试可能仍过，但接口契约坏了。
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="margin-top:0">Histogram</h3>
+        <p class="muted">每 block 256 线程，shared 上 256-bin 局部直方图，再写到 <code>block_hist[block][bucket]</code>。避免全局 atomic 热点。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Block Scan</h3>
+        <p class="muted">256 线程（一线程一 bucket）串行扫所有 block，得到 exclusive base。正确但 O(num_blocks)——大 N 时是优化点。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Prefix (256)</h3>
+        <p class="muted">warp Kogge-Stone + 单 warp 归约，算各 bucket 的全局起始偏移。小到可以单 block 完成。</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Scatter</h3>
+        <p class="muted">稳定写：global_off + block_base + warp_off + lane_rank。随机写 HBM，通常是整趟 sort 的瓶颈之一。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 5 ================= -->
+  <section id="s5">
+    <h2><span class="num">5</span> Float → 无符号序：符号位翻转（动画）</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">
+        IEEE 754 不能直接当无符号整数比大小。经典手法：
+        <code>mask = (bits >> 31) | 0x80000000</code>，再 <code>bits ^ mask</code>。
+        负数整体翻转到低半区，正数保留符号位为 1 的高半区，从而 radix 按无符号桶排序即数值序。
+      </p>
+
+      <div class="controls">
+        <button class="primary" id="btnBitDemo">演示变换</button>
+        <button id="btnBitNeg">示例：负数</button>
+        <button id="btnBitPos">示例：正数</button>
+        <span class="muted" id="bitLabel" style="font-size:.88rem">点击开始</span>
+      </div>
+      <div class="bits" id="bitRow"></div>
+      <p class="muted" style="font-size:.85rem; text-align:center">
+        高 8 位高亮 = 当前 pass 的 bucket（shift=24 时示意）
+      </p>
+
+<pre><span class="cm">// float32 get_bucket</span>
+uint32_t bits = __float_as_uint(val);
+uint32_t mask = (int32_t(bits) >> 31) | <span class="num">0x80000000u</span>;
+<span class="kw">return</span> ((bits ^ mask) >> shift) & <span class="num">0xFF</span>;</pre>
+
+      <div class="callout warn">
+        <strong>⚠️ 特殊值</strong>
+        <code>-0.0</code> / <code>+0.0</code>、NaN 的 bit 序与 <code>torch.sort</code> 未必完全一致。
+        若 harness 含 NaN，需对照参考实现；普通有限值这套变换是标准且可靠的。
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 6 ================= -->
+  <section id="s6">
+    <h2><span class="num">6</span> 稳定 Scatter：rank 动画</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">
+        同一 bucket 内要保持输入相对序（stable）。submission 用三层偏移：
+      </p>
+<pre>out_index = d_offsets[bucket]          <span class="cm">// 全局 bucket 起点</span>
+          + d_block_base[block][bucket]  <span class="cm">// 本 block 之前的同 bucket 数</span>
+          + warp_offs[warp][bucket]      <span class="cm">// 本 block 内前序 warp</span>
+          + rank;                        <span class="cm">// 同 warp 内 lane 序</span></pre>
+
+      <div class="controls">
+        <button class="primary" id="btnScatter">播放稳定写入</button>
+        <button id="btnScatterReset">清空棋盘</button>
+        <span class="muted" id="scatterStatus" style="font-size:.88rem">8 个元素 · 按 bucket 着色写入</span>
+      </div>
+      <div class="board" id="scatterBoard"></div>
+      <p class="muted" style="font-size:.85rem">
+        同色 = 同 bucket。写入顺序从左到右模拟「先出现的先占坑」——稳定排序的视觉版。
+      </p>
+
+      <div class="callout danger">
+        <strong>🚫 shfl 陷阱</strong>
+        <code>__shfl_sync(0xffffffff, ...)</code> 要求 mask 内<strong>所有 lane 都执行</code>。
+        不要把 shfl 塞进 <code>if (gid &lt; n)</code>——末 block 会有活 lane 永远等死 lane，直接 hang。
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 7 ================= -->
+  <section id="s7">
+    <h2><span class="num">7</span> TMA 为什么这次没上？（避雷清单）</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">
+        Hopper/Blackwell 的 TMA 很香，但 API 约束极严。sort_v2 早期 TMA 版踩过的坑：
+      </p>
+      <ul class="check-list">
+        <li>
+          <span class="mark dont">×</span>
+          <div><strong>boxDim ≤ 256</strong><br><span class="muted">一次 TMA tile 每维最多 256 元素。2048 直接 Encode 失败。</span></div>
+        </li>
+        <li>
+          <span class="mark dont">×</span>
+          <div><strong>线性 smem 必须 SWIZZLE_NONE</strong><br><span class="muted">SWIZZLE_128B 会重排 bank；你还按 <code>smem[i]</code> 读 = 数据错乱。</span></div>
+        </li>
+        <li>
+          <span class="mark dont">×</span>
+          <div><strong>barrier 期望 arrive 数 = 参与线程数</strong><br><span class="muted"><code>init(&bar, 1)</code> 却 256 线程 <code>arrive_and_wait</code> = UB / hang。</span></div>
+        </li>
+        <li>
+          <span class="mark dont">×</span>
+          <div><strong>必须 barrier_expect_tx(bytes)</strong><br><span class="muted">TMA 用 complete_tx 减计数；不 expect 就等不到完成。</span></div>
+        </li>
+        <li>
+          <span class="mark dont">×</span>
+          <div><strong>CUDA 13.3 experimental API 弃用</strong><br><span class="muted">应迁到 <code>cuda::ptx::cp_async_bulk_tensor</code>，并在匹配的工具链上验证。</span></div>
+        </li>
+        <li>
+          <span class="mark do">✓</span>
+          <div><strong>正确性优先时：普通 load + 清晰 radix</strong><br><span class="muted">先过测再上 TMA。带宽优化建立在「编得过、结果对」之上。</span></div>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ================= 8 ================= -->
+  <section id="s8">
+    <h2><span class="num">8</span> B200 算子 Checklist</h2>
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="margin-top:0">提交前</h3>
+        <ul class="check-list">
+          <li><span class="mark do">✓</span><div>arch = sm_100 / compute_100</div></li>
+          <li><span class="mark do">✓</span><div>不依赖 load_inline 编 CUDA（评测镜像雷）</div></li>
+          <li><span class="mark do">✓</span><div>CUDA 源不含 torch headers</div></li>
+          <li><span class="mark do">✓</span><div><code>torch.cuda.synchronize()</code> 后再返回</div></li>
+          <li><span class="mark do">✓</span><div>不破坏 input；n=0 早退</div></li>
+          <li><span class="mark do">✓</span><div>f32 / f64 都测</div></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Kernel 习惯</h3>
+        <ul class="check-list">
+          <li><span class="mark do">✓</span><div>shared hist 再写 global，少全局 atomic</div></li>
+          <li><span class="mark do">✓</span><div>稳定排序：block/warp/lane 分层 rank</div></li>
+          <li><span class="mark do">✓</span><div>shfl 全 warp 参与</div></li>
+          <li><span class="mark do">✓</span><div>static 缓冲按 capacity 增长 + CUDA_CHECK</div></li>
+          <li><span class="mark dont">×</span><div>想当然用 sm_90a「反正新卡能 JIT」</div></li>
+          <li><span class="mark dont">×</span><div>未验证就上 experimental TMA</div></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">submission.py 结构一览</h3>
+<pre>submission.py
+├── CUDA_SRC          <span class="cm"># 纯 CUDA 字符串：radix kernels + host launch</span>
+├── _get_lib()        <span class="cm"># hash 缓存 · nvcc -shared · ctypes</span>
+└── custom_kernel()   <span class="cm"># contiguous · dtype 分发 · sync · 可选 copy_ out</span></pre>
+    </div>
+  </section>
+
+  <!-- ================= 9 ================= -->
+  <section id="s9">
+    <h2><span class="num">9</span> 下一步：怎么冲 Leaderboard</h2>
+    <div class="card">
+      <p class="muted" style="margin-top:0">当前实现是「正确基线」。要进榜通常还要：</p>
+      <div class="grid-2">
+        <div>
+          <h3>算法层</h3>
+          <ul class="muted">
+            <li>分层 / CUB 做 block scan，干掉 O(grid) 串行</li>
+            <li>Onesweep / 减少 pass 间全局同步</li>
+            <li>直接链 CUB <code>DeviceRadixSort</code>（注意编译隔离）</li>
+            <li>digit size 调参（7/8 bit）权衡 hist 与 pass 数</li>
+          </ul>
+        </div>
+        <div>
+          <h3>体系结构层</h3>
+          <ul class="muted">
+            <li>在<strong>独立 nvcc</strong> 工程里试 TMA load（box≤256, NONE swizzle）</li>
+            <li>scatter 侧减少 bank 冲突 / 多通道缓冲</li>
+            <li>持久化缓冲，避免每 shape 都 cudaMalloc</li>
+            <li>Nsight Compute 看 memory throughput 与 warp stall</li>
+          </ul>
+        </div>
+      </div>
+      <div class="callout tip">
+        <strong>💡 方法论</strong>
+        每一次优化只动一个变量，并在 B200 评测机上回归正确性。
+        「本地 3050 快 10%」对 leaderboard 几乎无信息量。
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    基于 <code>sort_v2/submission.py</code> 实战整理 · B200 / GPU MODE popcorn · 图文动画版 TIPS<br />
+    打开本文件即可离线阅读，无需服务器。
+  </footer>
+</div>
+
+<script>
+/* ========== GPU SM grid ========== */
+(function () {
+  const grid = document.getElementById('smGrid');
+  for (let i = 0; i < 32; i++) {
+    const d = document.createElement('div');
+    d.className = 'sm';
+    grid.appendChild(d);
+  }
+  const gpu = document.getElementById('gpuDemo');
+  document.getElementById('btnGpuRun').onclick = () => gpu.classList.add('running');
+  document.getElementById('btnGpuStop').onclick = () => gpu.classList.remove('running');
+  gpu.classList.add('running');
+})();
+
+/* ========== Pipeline animation ========== */
+(function () {
+  const stages = [...document.querySelectorAll('.pipe-stage')];
+  const fill = document.getElementById('passFill');
+  const status = document.getElementById('pipeStatus');
+  let pass = 0, step = 0, timer = null;
+  const TOTAL_PASS = 4;
+
+  function paint() {
+    stages.forEach((el, i) => el.classList.toggle('active', i === step));
+    fill.style.width = ((pass + (step + 1) / 4) / TOTAL_PASS * 100) + '%';
+    const names = ['Histogram', 'Block Scan', 'Prefix', 'Scatter'];
+    status.textContent = `Pass ${pass + 1}/${TOTAL_PASS} · ${names[step]} · shift=${pass * 8}`;
+  }
+
+  function advance() {
+    step++;
+    if (step > 3) {
+      step = 0;
+      pass++;
+      if (pass >= TOTAL_PASS) {
+        pass = TOTAL_PASS - 1;
+        step = 3;
+        fill.style.width = '100%';
+        status.textContent = '✅ 4 passes 完成 · 结果在 output / scratch 已归位';
+        stages.forEach(el => el.classList.remove('active'));
+        clearInterval(timer); timer = null;
+        return;
+      }
+    }
+    paint();
+  }
+
+  function reset() {
+    clearInterval(timer); timer = null;
+    pass = 0; step = 0;
+    fill.style.width = '0%';
+    stages.forEach(el => el.classList.remove('active'));
+    status.textContent = '待命 · pass 0 / 4';
+  }
+
+  document.getElementById('btnPipeReset').onclick = reset;
+  document.getElementById('btnPipeStep').onclick = () => {
+    if (pass >= TOTAL_PASS - 1 && step >= 3 && fill.style.width === '100%') reset();
+    if (timer) { clearInterval(timer); timer = null; }
+    if (status.textContent.includes('完成')) { reset(); }
+    if (!stages.some(s => s.classList.contains('active')) && pass === 0 && step === 0 && fill.style.width === '0%') {
+      paint();
+      return;
+    }
+    advance();
+  };
+  document.getElementById('btnPipePlay').onclick = () => {
+    reset();
+    paint();
+    timer = setInterval(advance, 700);
+  };
+})();
+
+/* ========== Bit flip demo ========== */
+(function () {
+  const row = document.getElementById('bitRow');
+  const label = document.getElementById('bitLabel');
+  const bits = [];
+  for (let i = 0; i < 16; i++) {
+    const b = document.createElement('div');
+    b.className = 'bit';
+    b.textContent = '0';
+    row.appendChild(b);
+    bits.push(b);
+  }
+
+  function floatToBits(f) {
+    const buf = new ArrayBuffer(4);
+    new Float32Array(buf)[0] = f;
+    return new Uint32Array(buf)[0] >>> 0;
+  }
+
+  function showBits(u, mode) {
+    // show top 16 bits for readability
+    for (let i = 0; i < 16; i++) {
+      const bit = (u >>> (31 - i)) & 1;
+      bits[i].textContent = bit;
+      bits[i].className = 'bit' + (bit ? ' on' : '');
+      if (mode === 'flip' && i === 0) bits[i].classList.add('flip');
+      if (mode === 'bucket' && i < 8) bits[i].classList.add('bucket');
+    }
+  }
+
+  function transform(u) {
+    const mask = ((u | 0) >> 31) | 0x80000000;
+    return (u ^ mask) >>> 0;
+  }
+
+  async function run(val) {
+    const u = floatToBits(val);
+    label.textContent = `原始 float = ${val} · bits=0x${u.toString(16)}`;
+    showBits(u, 'raw');
+    await wait(700);
+    label.textContent = '应用符号位 mask / xor …';
+    showBits(u, 'flip');
+    await wait(800);
+    const t = transform(u);
+    showBits(t, 'bucket');
+    label.textContent = `变换后 = 0x${t.toString(16)} · 高 8 位 = bucket(shift=24) → ${(t >>> 24) & 0xff}`;
+  }
+
+  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  document.getElementById('btnBitDemo').onclick = () => run(-3.5);
+  document.getElementById('btnBitNeg').onclick = () => run(-1.25);
+  document.getElementById('btnBitPos').onclick = () => run(2.75);
+  showBits(floatToBits(-3.5), 'raw');
+  label.textContent = '示例默认 -3.5 · 点击「演示变换」';
+})();
+
+/* ========== Scatter board ========== */
+(function () {
+  const board = document.getElementById('scatterBoard');
+  const status = document.getElementById('scatterStatus');
+  const cells = [];
+  for (let i = 0; i < 8; i++) {
+    const c = document.createElement('div');
+    c.className = 'cell';
+    c.textContent = i;
+    board.appendChild(c);
+    cells.push(c);
+  }
+
+  // demo keys and buckets (2-bit toy)
+  const items = [
+    { v: 5, b: 1, color: '#5b8cff' },
+    { v: 2, b: 0, color: '#37d6c5' },
+    { v: 7, b: 1, color: '#5b8cff' },
+    { v: 1, b: 0, color: '#37d6c5' },
+    { v: 9, b: 2, color: '#c084fc' },
+    { v: 3, b: 0, color: '#37d6c5' },
+    { v: 8, b: 2, color: '#c084fc' },
+    { v: 6, b: 1, color: '#5b8cff' },
+  ];
+
+  function reset() {
+    cells.forEach((c, i) => {
+      c.className = 'cell';
+      c.style.background = '';
+      c.textContent = i;
+    });
+    status.textContent = '8 个元素 · 按 bucket 着色写入';
+  }
+
+  async function play() {
+    reset();
+    // stable positions by bucket order 0,1,2 with stable within
+    const order = [];
+    for (const bucket of [0, 1, 2]) {
+      items.forEach((it, idx) => {
+        if (it.b === bucket) order.push({ ...it, src: idx });
+      });
+    }
+    for (let i = 0; i < order.length; i++) {
+      await wait(380);
+      const it = order[i];
+      const cell = cells[i];
+      cell.classList.add('filled');
+      cell.style.background = it.color;
+      cell.textContent = it.v;
+      status.textContent = `写入 out[${i}] ← ${it.v} (bucket ${it.b}, 源序 ${it.src})`;
+    }
+    status.textContent = '✅ 稳定排序完成：同 bucket 内保持输入相对顺序';
+  }
+
+  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  document.getElementById('btnScatter').onclick = play;
+  document.getElementById('btnScatterReset').onclick = reset;
+})();
+</script>
+</body>
+</html>
