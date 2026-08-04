@@ -62,7 +62,7 @@ histogram_kernel_tma(const __grid_constant__ CUtensorMap tensor_map,
   int warp = tid >> 5;
   int lane = tid & 31;
 
-  // Zero warp histograms
+  // Zero warp histograms`
   for (int i = tid; i < 8 * 256; i += BLOCK_SIZE)
     ((uint32_t *)warp_hist)[i] = 0;
 

@@ -1,2 +1,8 @@
 config.yaml
 .comet.config
+
+.venv-cuda
+.claude
+.clangd
+*.html
+*/__pycache__
