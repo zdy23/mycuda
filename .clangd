@@ -1,6 +1,6 @@
 CompileFlags:
-  Add: 
-    - -xcuda
-    - --cuda-gpu-arch=sm_86
+  Add:
     - --cuda-path=/usr/local/cuda-12.8
-  Remove: [-m*, -f*]
+    - --cuda-gpu-arch=sm_86
+    - -std=c++17
+

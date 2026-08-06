@@ -6,3 +6,5 @@ config.yaml
 .clangd
 *.html
 */__pycache__
+
+kernel_log.md
