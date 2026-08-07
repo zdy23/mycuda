@@ -132,11 +132,13 @@ __global__ void transpose_kernel(
 	}
 }
 
-template <int TS, int TPT, int TPB>
-void solve_impl(
-	const float* Q, const float* K, const float* V,
+// Q, K, V, output are device pointers
+extern "C" void solve(const float* Q, const float* K, const float* V,
 	float* output, int M, int N, int d
 ) {
+	const int TS = 16;
+	const int TPT = 4;
+	const int TPB = 512;
 	float* d_score;
 	float* d_kt;
 	cudaMalloc(&d_score, M * N * sizeof(float));
@@ -163,37 +165,4 @@ void solve_impl(
 
 	cudaFree(d_score);
 	cudaFree(d_kt);
-}
-
-// ================== 显式实例化 + 运行时分发 ==================
-
-// 用宏批量生成所有支持的参数组合实例化。
-// 修改这里的列表即可增删要 benchmark 的配置。
-#define CONFIGS(X)                                                       \
-	X(16, 1, 128) X(16, 1, 256) X(16, 1, 512)                           \
-	X(16, 2, 128) X(16, 2, 256) X(16, 2, 512)                           \
-	X(16, 4, 128) X(16, 4, 256) X(16, 4, 512)                           \
-	X(32, 1, 128) X(32, 1, 256) X(32, 1, 512)                           \
-	X(32, 2, 128) X(32, 2, 256) X(32, 2, 512)                           \
-	X(32, 4, 128) X(32, 4, 256) X(32, 4, 512)
-
-#define INST_INSTANCE(TS, TPT, TPB) \
-	template void solve_impl<TS, TPT, TPB>( \
-		const float*, const float*, const float*, float*, int, int, int);
-
-CONFIGS(INST_INSTANCE)
-
-#define DISPATCH_CASE(TS, TPT, TPB)                            \
-	if (tile_size == TS && tiles_per_thread == TPT             \
-		&& threads_per_block == TPB) {                         \
-		solve_impl<TS, TPT, TPB>(Q, K, V, output, M, N, d);   \
-		return;                                                \
-	}
-
-extern "C" void solve(
-	const float* Q, const float* K, const float* V,
-	float* output, int M, int N, int d,
-	int tile_size, int tiles_per_thread, int threads_per_block
-) {
-	CONFIGS(DISPATCH_CASE)
 }

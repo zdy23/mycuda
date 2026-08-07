@@ -1,193 +1,137 @@
 #include <cuda_runtime.h>
-#include <cfloat>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
-#include <algorithm>
+#include <vector>
 
-// Online softmax fused attention:
-//   O = softmax(Q @ K^T / sqrt(d)) @ V
-// Q [M, d], K [N, d], V [N, d], O [M, d] — row-major.
-// Single kernel, zero N×N buffer.  Grid-stride over queries, UNROLL for MLP.
+// solve.cu 里的 extern "C" solve，带模板配置参数
+extern "C" void solve(
+	const float* Q, const float* K, const float* V,
+	float* output, int M, int N, int d,
+	int tile_size, int tiles_per_thread, int threads_per_block);
 
-#define UNROLL 4
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    return val;
+static void usage(const char* prog) {
+	fprintf(stderr,
+		"usage: %s M N d tile_size tiles_per_thread threads_per_block [verify] [warmup] [repeat]\n"
+		"  M, N, d            矩阵维度 (Q: M * d, K/V: N * d, O: M * d)\n"
+		"  tile_size          GEMM tile 边长 (16/32)\n"
+		"  tiles_per_thread   线程粗化因子 (1/2/4)\n"
+		"  threads_per_block  softmax block 线程数 (128/256/512)\n"
+		"  verify             0/1 是否与 CPU 参考对比 (默认 1)\n"
+		"  warmup             预热次数 (默认 3)\n"
+		"  repeat             计时重复次数 (默认 10)\n"
+		"输出: 一行 JSON, 便于 python 解析\n", prog);
 }
 
-template <int threadsPerBlock>
-__global__ void __launch_bounds__(threadsPerBlock)
-softmax_attn_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
-    float* __restrict__ O,
-    int M, int N, int d)
-{
-    int tid   = threadIdx.x;
-    int num_threads = blockDim.x;
-    int num_warps   = num_threads >> 5;
-    int warp_id     = tid >> 5;
-    int lane_id     = tid & 31;
-
-    // Shared memory: [0, d) = qi, [d, 2d) = o_acc, [2d, ...) = warp_partial
-    extern __shared__ float smem[];
-    float* qi            = smem;
-    float* o_acc         = smem + d;
-    float* warp_partial  = smem + 2 * d;
-
-    float inv_scale = rsqrtf(static_cast<float>(d));
-
-    // Grid-stride over queries.
-    for (int q_idx = blockIdx.x; q_idx < M; q_idx += gridDim.x) {
-
-        // 1. Load query row (scalar + UNROLL for MLP).
-        const float* Q_row = Q + q_idx * d;
-        int step = num_threads * UNROLL;
-        int i = tid;
-        for (; i + (UNROLL - 1) * num_threads < d; i += step) {
-            float regs[UNROLL];
-            #pragma unroll
-            for (int u = 0; u < UNROLL; u++)
-                regs[u] = Q_row[i + u * num_threads];
-            #pragma unroll
-            for (int u = 0; u < UNROLL; u++)
-                qi[i + u * num_threads] = regs[u];
-        }
-        for (; i < d; i += num_threads)
-            qi[i] = Q_row[i];
-
-        // Zero output accumulator.
-        for (int k = tid; k < d; k += num_threads)
-            o_acc[k] = 0.0f;
-
-        float m = -FLT_MAX;
-        float l = 0.0f;
-
-        __syncthreads();
-
-        // 2. Main loop: iterate over all KV pairs.
-        for (int j = 0; j < N; j++) {
-
-            // 2a. Dot product: s = Q[i] · K[j]  (UNROLL, float4 from shared qi).
-            float dot = 0.0f;
-            const float* kj = K + j * d;
-            // float4 vectorized dot using qi in shared memory (aligned).
-            int n4 = d >> 2;
-            const float4* qi4 = reinterpret_cast<const float4*>(qi);
-            int k = tid;
-            int step4 = num_threads * UNROLL;
-            for (; k + (UNROLL - 1) * num_threads < n4; k += step4) {
-                float4 kj_regs[UNROLL];
-                #pragma unroll
-                for (int u = 0; u < UNROLL; u++) {
-                    int base = (k + u * num_threads) << 2;
-                    kj_regs[u] = make_float4(
-                        kj[base], kj[base+1], kj[base+2], kj[base+3]);
-                }
-                #pragma unroll
-                for (int u = 0; u < UNROLL; u++) {
-                    int idx = k + u * num_threads;
-                    float4 qv = qi4[idx];
-                    dot += qv.x * kj_regs[u].x + qv.y * kj_regs[u].y
-                         + qv.z * kj_regs[u].z + qv.w * kj_regs[u].w;
-                }
-            }
-            for (; k < n4; k += num_threads) {
-                int base = k << 2;
-                float4 qv = qi4[k];
-                dot += qv.x * kj[base] + qv.y * kj[base+1]
-                     + qv.z * kj[base+2] + qv.w * kj[base+3];
-            }
-            // Scalar tail.
-            for (int t = n4 * 4 + tid; t < d; t += num_threads)
-                dot += qi[t] * kj[t];
-
-            // Warp reduce -> warp_partial -> block reduce.
-            dot = warp_reduce_sum(dot);
-            if (lane_id == 0)
-                warp_partial[warp_id] = dot;
-            __syncthreads();
-
-            float s = 0.0f;
-            if (warp_id == 0) {
-                if (lane_id < num_warps)
-                    s = warp_partial[lane_id];
-                s = warp_reduce_sum(s);
-                if (lane_id == 0) {
-                    s *= inv_scale;
-
-                    // 2b. Online softmax update.
-                    float m_old = m;
-                    float m_new = fmaxf(m_old, s);
-                    float correction = __expf(m_old - m_new);
-                    l = l * correction + __expf(s - m_new);
-                    m = m_new;
-
-                    warp_partial[0] = correction;
-                    warp_partial[1] = __expf(s - m_new);
-                }
-            }
-            __syncthreads();
-
-            // 2c. Accumulate: o_acc += P_ij * V[j].
-            float correction = warp_partial[0];
-            float P_ij       = warp_partial[1];
-            const float* vj  = V + j * d;
-
-            // float4 in shared memory o_acc (aligned).
-            float4* o4 = reinterpret_cast<float4*>(o_acc);
-            for (int k2 = tid; k2 < n4; k2 += num_threads) {
-                int base = k2 << 2;
-                o4[k2].x = o4[k2].x * correction + P_ij * vj[base];
-                o4[k2].y = o4[k2].y * correction + P_ij * vj[base+1];
-                o4[k2].z = o4[k2].z * correction + P_ij * vj[base+2];
-                o4[k2].w = o4[k2].w * correction + P_ij * vj[base+3];
-            }
-            for (int k2 = n4 * 4 + tid; k2 < d; k2 += num_threads)
-                o_acc[k2] = o_acc[k2] * correction + P_ij * vj[k2];
-        }
-
-        // 3. Finalize: O[i] = o_acc / l.
-        float inv_l = 1.0f / l;
-        __syncthreads();
-
-        for (int k = tid; k < d; k += num_threads)
-            O[q_idx * d + k] = o_acc[k] * inv_l;
-
-        __syncthreads();
-    }
+// CPU 参考实现: O = softmax(Q K^T / sqrt(d)) V
+static void cpu_ref(const std::vector<float>& Q, const std::vector<float>& K,
+					const std::vector<float>& V, std::vector<float>& O,
+					int M, int N, int d) {
+	float scale = sqrtf((float)d);
+	std::vector<float> score(N);
+	for (int i = 0; i < M; i++) {
+		float m = -1e30f;
+		for (int j = 0; j < N; j++) {
+			float s = 0.0f;
+			for (int k = 0; k < d; k++)
+				s += Q[i * d + k] * K[j * d + k];
+			s /= scale;
+			score[j] = s;
+			if (s > m) m = s;
+		}
+		float l = 0.0f;
+		for (int j = 0; j < N; j++) { score[j] = expf(score[j] - m); l += score[j]; }
+		for (int j = 0; j < N; j++) score[j] /= l;
+		for (int k = 0; k < d; k++) {
+			float o = 0.0f;
+			for (int j = 0; j < N; j++) o += score[j] * V[j * d + k];
+			O[i * d + k] = o;
+		}
+	}
 }
 
+int main(int argc, char** argv) {
+	if (argc < 7) { usage(argv[0]); return 1; }
 
-extern "C" void solve(const float* Q, const float* K, const float* V,
-                      float* O, int M, int N, int d)
-{
-    if (M <= 0 || N <= 0 || d <= 0)
-        return;
+	int M = atoi(argv[1]);
+	int N = atoi(argv[2]);
+	int d = atoi(argv[3]);
+	int tile_size = atoi(argv[4]);
+	int tpt = atoi(argv[5]);
+	int tpb = atoi(argv[6]);
+	int verify = argc > 7 ? atoi(argv[7]) : 1;
+	int warmup = argc > 8 ? atoi(argv[8]) : 3;
+	int repeat = argc > 9 ? atoi(argv[9]) : 10;
 
-    const int threadsPerBlock = 256;
-    int num_warps = threadsPerBlock >> 5;
+	if (M <= 0 || N <= 0 || d <= 0) { fprintf(stderr, "bad dims\n"); return 1; }
 
-    static int maxBlocks = -1;
-    if (maxBlocks < 0) {
-        int nb_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &nb_per_sm, softmax_attn_kernel<threadsPerBlock>, threadsPerBlock, 0);
-        int sm_count = 0;
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-        maxBlocks = nb_per_sm * sm_count;
-        if (maxBlocks < 1) maxBlocks = 1;
-    }
+	size_t qk_bytes = (size_t)M * d * sizeof(float);
+	size_t v_bytes = (size_t)N * d * sizeof(float);
+	size_t o_bytes = qk_bytes;
 
-    int blocksPerGrid = std::min(M, maxBlocks);
+	std::vector<float> h_Q((size_t)M * d), h_K((size_t)N * d), h_V((size_t)N * d);
+	std::vector<float> h_O((size_t)M * d);
 
-    int shared_bytes = 2 * d * sizeof(float)
-                     + num_warps * sizeof(float);
+	srand(42);
+	auto randf = []() { return (float)rand() / RAND_MAX * 2.0f - 1.0f; };
+	for (auto& x : h_Q) x = randf();
+	for (auto& x : h_K) x = randf();
+	for (auto& x : h_V) x = randf();
 
-    softmax_attn_kernel<threadsPerBlock>
-        <<<blocksPerGrid, threadsPerBlock, shared_bytes>>>(Q, K, V, O, M, N, d);
-    cudaDeviceSynchronize();
+	float *d_Q, *d_K, *d_V, *d_O;
+	cudaMalloc(&d_Q, qk_bytes);
+	cudaMalloc(&d_K, v_bytes);
+	cudaMalloc(&d_V, v_bytes);
+	cudaMalloc(&d_O, o_bytes);
+	cudaMemcpy(d_Q, h_Q.data(), qk_bytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_K, h_K.data(), v_bytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_V, h_V.data(), v_bytes, cudaMemcpyHostToDevice);
+
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	// warmup
+	for (int i = 0; i < warmup; i++)
+		solve(d_Q, d_K, d_V, d_O, M, N, d, tile_size, tpt, tpb);
+	cudaDeviceSynchronize();
+
+	// timed
+	float best = 1e30f;
+	for (int i = 0; i < repeat; i++) {
+		cudaEventRecord(start);
+		solve(d_Q, d_K, d_V, d_O, M, N, d, tile_size, tpt, tpb);
+		cudaEventRecord(stop);
+		cudaEventSynchronize(stop);
+		float ms;
+		cudaEventElapsedTime(&ms, start, stop);
+		if (ms < best) best = ms;
+	}
+
+	// correctness
+	double max_err = -1.0;
+	if (verify) {
+		cudaMemcpy(h_O.data(), d_O, o_bytes, cudaMemcpyDeviceToHost);
+		std::vector<float> ref((size_t)M * d);
+		cpu_ref(h_Q, h_K, h_V, ref, M, N, d);
+		for (size_t i = 0; i < h_O.size(); i++) {
+			double e = fabs((double)h_O[i] - ref[i]);
+			if (e > max_err) max_err = e;
+		}
+	}
+
+	// JSON 输出
+	printf("{\"M\":%d,\"N\":%d,\"d\":%d,\"ts\":%d,\"tpt\":%d,\"tpb\":%d,"
+		   "\"ms\":%.4f,\"err\":%s}\n",
+		M, N, d, tile_size, tpt, tpb, best,
+		verify ? (max_err < 1e-3 ? "\"ok\"" : "\"FAIL\"") : "\"skip\"");
+
+	if (verify && max_err >= 1e-3) {
+		fprintf(stderr, "VERIFY FAILED: max_err=%e\n", max_err);
+	}
+
+	cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+	cudaEventDestroy(start); cudaEventDestroy(stop);
+	return 0;
 }
