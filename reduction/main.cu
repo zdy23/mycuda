@@ -44,17 +44,28 @@ __global__ void reduceKernel_small(const float* input, float* output, int N) {
 	float sum = 0.0f;
 	float *sums = smem;
 
-	// thread coarsening
+	const float4* v4in = reinterpret_cast<const float4*>(input);
+	int N4 = N >> 2;
+
+	// thread coarsening — float4 main loop
 	int i = tid;
-	for (; i + stride - blockDim.x < N; i += stride) {
+	for (; i + stride - blockDim.x < N4; i += stride) {
 		#pragma unroll
 		for (int u = 0; u < UNROLL; u++) {
-			sum += input[i + u * blockDim.x];
+			float4 v = v4in[i + u * blockDim.x];
+			sum += v.x + v.y + v.z + v.w;
 		}
 	}
 
-	for (; i < N; i += blockDim.x) {
-		sum += input[i];
+	// float4 tail
+	for (; i < N4; i += blockDim.x) {
+		float4 v = v4in[i];
+		sum += v.x + v.y + v.z + v.w;
+	}
+
+	// scalar tail (N not multiple of 4) — grid-stride
+	for (int j = N4 * 4 + blockIdx.x * blockDim.x + tid; j < N; j += blockDim.x * gridDim.x) {
+		sum += input[j];
 	}
 
 	sum = warp_reduce(sum);
@@ -80,18 +91,28 @@ __global__ void reduceKernel_large(const float* input, float* partial, int N) {
 
 	float sum = 0.0f;
 
-	// grid-stride loop + unrolling
+	const float4* v4in = reinterpret_cast<const float4*>(input);
+	int N4 = N >> 2;
+
+	// grid-stride loop + float4 unrolling
 	int i = blockIdx.x * stride + tid;
-	for (; i + stride - blockDim.x < N; i += stride * gridDim.x) {
+	for (; i + stride - blockDim.x < N4; i += stride * gridDim.x) {
 		#pragma unroll
 		for (int u = 0; u < UNROLL; u++) {
-			sum += input[i + u * blockDim.x];
+			float4 v = v4in[i + u * blockDim.x];
+			sum += v.x + v.y + v.z + v.w;
 		}
 	}
 
-	// tail case
-	for (; i < N; i += blockDim.x) {
-		sum += input[i];
+	// float4 tail
+	for (; i < N4; i += blockDim.x) {
+		float4 v = v4in[i];
+		sum += v.x + v.y + v.z + v.w;
+	}
+
+	// scalar tail (N not multiple of 4) — grid-stride
+	for (int j = N4 * 4 + blockIdx.x * blockDim.x + tid; j < N; j += blockDim.x * gridDim.x) {
+		sum += input[j];
 	}
 
 	sum = block_reduce(sum, smem);
@@ -107,7 +128,9 @@ extern "C" void solve(const float* input, float* output, int N) {
 	const int warps = threads / 32;
 	const size_t smem_size = warps * sizeof(float);
 
-	if (N <= threads * UNROLL * 8) {
+	const int perBlock = threads * UNROLL * 4;
+
+	if (N <= perBlock * 8) {
 		// small: one block sweeps everything, writes output[0]
 		reduceKernel_small<<<1, threads, smem_size>>>(input, output, N);
 		cudaDeviceSynchronize();
@@ -115,7 +138,7 @@ extern "C" void solve(const float* input, float* output, int N) {
 	}
 
 	// large: two-pass block-tile reduction
-	int blocks = (N + threads * UNROLL - 1) / (threads * UNROLL);
+	int blocks = (N + perBlock - 1) / perBlock;
 	if (blocks > 1024) blocks = 1024;
 
 	float *partial = nullptr;
