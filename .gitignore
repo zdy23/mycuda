@@ -7,4 +7,23 @@ config.yaml
 *.html
 */__pycache__
 
+tmp
 kernel_log.md
+
+cs224n
+
+# 二进制和产物
+*.bin
+*.o
+*.exe
+softmax_attn/attn_bench
+softmax_attn/softmax_attn
+
+cs224n
+
+# JSON 数据/结果
+*.json
+!opencode.json
+!opencode.jsonc
+!tsconfig.json
+!package.json
