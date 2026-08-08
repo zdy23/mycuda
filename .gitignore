@@ -19,7 +19,6 @@ cs224n
 softmax_attn/attn_bench
 softmax_attn/softmax_attn
 
-cs224n
 
 # JSON 数据/结果
 *.json
