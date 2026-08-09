@@ -22,6 +22,13 @@ __global__ void gemm_tiled(
 	int row_base = rowT * TM + mblk * TS;
 	int col_base = colT * TN + nblk * TS;
 
+	float acc[TM][TN];
+	for (int i = 0; i < TM; ++i) {
+		for (int j = 0; j < TN; j++) {
+			acc[i][j] = 0.f;
+		}
+	}
+
 	for (int i = 0; i < (K + TS - 1) / TS; ++i) {
 		// load As
 		#pragma unroll
@@ -35,11 +42,51 @@ __global__ void gemm_tiled(
 					: __float2half(0.f);
 			}
 		}
-		__syncthreads();
 
 		// load Bs
 		#pragma unroll
+		for (int r = 0; r < TM; ++r) {
+			#pragma unroll
+			for (int c = 0; c < TN; ++c) {
+				int b_krow = i * TS + rowT * TM + r;
+				int b_col = col_base + c;
+				Bs[rowT * TM + r][colT * TN + c] =
+					(b_krow < K && b_col < N) ? B[b_krow * N + b_col]
+					: __float2half(0.f);
+			}
+		}
+		__syncthreads();
 
+		for (int k = 0; k < TS; ++k) {
+			float b[TN];
+			#pragma unroll
+			for (int c = 0; c < TN; ++c) {
+				b[c] = __half2float(Bs[k][colT * TN + c]);
+			}
+
+			#pragma unroll
+			for (int r = 0; r < TM; ++r) {
+				float a = __half2float(As[rowT * TM + r][k]);
+				#pragma unroll
+				for (int c = 0; c < TN; ++c) {
+					acc[r][c] += a * b[c];
+				}
+			}
+		}
+		__syncthreads();
+	}
+
+	#pragma unroll
+	for (int r = 0; r < TM; ++r) {
+		int row = row_base + r;
+		#pragma unroll
+		for (int c = 0; c < TN; ++c) {
+			int col = col_base + c;
+			if (row < M && col < N) {
+				float old = (beta != 0.f) ? beta * __half2float(C[row * N + col]) : 0.f;
+				C[row * N + col] = __float2half(alpha * acc[r][c] + old);
+			}
+		}
 	}
 
 }
