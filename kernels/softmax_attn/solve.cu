@@ -9,15 +9,14 @@ V:  N × d
 O:  M × d
 
 Pipeline:
-  1) K^T
-  2) score = Q @ K^T / sqrt(d)
-  3) row softmax(score)
-  4) O = score @ V
+  1) score = Q @ K^T / sqrt(d)
+  2) row softmax(score)
+  3) O = score @ V
 */
 
 #define LOG2_E 1.4426950408889634f
 
-template <int TS, int TPT>
+template <int TS, int TPT, bool TRANSPOSED_B = false>
 __global__ void matmul_kernel(
 	const float* __restrict__ A,
 	const float* __restrict__ B,
@@ -45,7 +44,9 @@ __global__ void matmul_kernel(
 			int col  = colBase + i * TS;
 			int bRow = phase * TS + threadIdx.y;
 			Bs[threadIdx.y][threadIdx.x] =
-				(bRow < R && col < K) ? B[bRow * K + col] : 0.0f;
+				(bRow < R && col < K)
+					? (TRANSPOSED_B ? B[col * R + bRow] : B[bRow * K + col])
+					: 0.0f;
 			__syncthreads();
 
 			#pragma unroll
@@ -66,8 +67,6 @@ __global__ void matmul_kernel(
 template <int TPB>
 __global__ void row_softmax_kernel(float* __restrict__ input, int M, int N) {
 	constexpr int NUM_WARPS = TPB / 32;
-	static_assert(NUM_WARPS * 32 == TPB, "TPB multiple of 32");
-
 	int row  = blockIdx.x;
 	if (row >= M) return;
 
@@ -140,25 +139,6 @@ __global__ void row_softmax_kernel(float* __restrict__ input, int M, int N) {
 	}
 }
 
-template <int TS>
-__global__ void transpose_kernel(
-	const float* __restrict__ input, float* __restrict__ output,
-	int rows, int cols
-) {
-	__shared__ float tile[TS][TS + 1];
-
-	int x = blockIdx.x * TS + threadIdx.x;
-	int y = blockIdx.y * TS + threadIdx.y;
-	if (y < rows && x < cols)
-		tile[threadIdx.y][threadIdx.x] = input[y * cols + x];
-	__syncthreads();
-
-	x = blockIdx.y * TS + threadIdx.x;
-	y = blockIdx.x * TS + threadIdx.y;
-	if (y < cols && x < rows)
-		output[y * rows + x] = tile[threadIdx.x][threadIdx.y];
-}
-
 extern "C" void solve(const float* Q, const float* K, const float* V,
 	float* output, int M, int N, int d
 ) {
@@ -167,35 +147,23 @@ extern "C" void solve(const float* Q, const float* K, const float* V,
 	constexpr int TPB = 256;
 
 	static float* d_score = nullptr;
-	static float* d_kt    = nullptr;
 	static size_t cap_score = 0;
-	static size_t cap_kt    = 0;
 
 	size_t need_score = (size_t)M * (size_t)N * sizeof(float);
-	size_t need_kt    = (size_t)d * (size_t)N * sizeof(float);
 	if (need_score > cap_score) {
 		if (d_score) cudaFree(d_score);
 		cudaMalloc(&d_score, need_score);
 		cap_score = need_score;
-	}
-	if (need_kt > cap_kt) {
-		if (d_kt) cudaFree(d_kt);
-		cudaMalloc(&d_kt, need_kt);
-		cap_kt = need_kt;
 	}
 
 	dim3 block(TS, TS);
 	float inv_scale = 1.0f / sqrtf((float)d);
 
 	{
-		dim3 grid((d + TS - 1) / TS, (N + TS - 1) / TS);
-		transpose_kernel<TS><<<grid, block>>>(K, d_kt, N, d);
-	}
-	{
 		dim3 grid((N + TS * TPT - 1) / (TS * TPT),
 				  (M + TS - 1) / TS);
-		matmul_kernel<TS, TPT><<<grid, block>>>(
-			Q, d_kt, d_score, M, d, N, inv_scale);
+		matmul_kernel<TS, TPT, true><<<grid, block>>>(
+			Q, K, d_score, M, d, N, inv_scale);
 	}
 
 	row_softmax_kernel<TPB><<<M, TPB>>>(d_score, M, N);
