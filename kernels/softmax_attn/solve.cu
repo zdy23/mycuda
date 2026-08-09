@@ -2,68 +2,97 @@
 #include <cfloat>
 #include <cmath>
 
-/*
-Q:  M × d
-K:  N × d
-V:  N × d
-O:  M × d
-
-Pipeline:
-  1) score = Q @ K^T / sqrt(d)
-  2) row softmax(score)
-  3) O = score @ V
-*/
-
 #define LOG2_E 1.4426950408889634f
 
-template <int TS, int TPT, bool TRANSPOSED_B = false>
+// Matrix mul kernel with shared memory tiling and register blocking
+template <int TS, int TM, int TN, bool TRANSPOSED_B = false>
 __global__ void matmul_kernel(
 	const float* __restrict__ A,
 	const float* __restrict__ B,
 	float* __restrict__ C,
 	int M, int R, int K, float inv_scale
 ) {
-	__shared__ float As[TS][TS];
+	__shared__ float As[TS][TS + 1];
 	__shared__ float Bs[TS][TS];
 
-	int row     = TS * blockIdx.y + threadIdx.y;
-	int colBase = TPT * TS * blockIdx.x + threadIdx.x;
+	int tx = threadIdx.x;
+	int ty = threadIdx.y;
+	int bx = blockIdx.x;
+	int by = blockIdx.y;
 
-	float sum[TPT];
+	int rowBlock = TS * by;
+	int colBlock = TS * bx;
+	int row0     = rowBlock + ty * TM;
+	int col0     = colBlock + tx * TN;
+
+	// init acc
+	float acc[TM][TN];
 	#pragma unroll
-	for (int i = 0; i < TPT; i++) sum[i] = 0.0f;
+	for (int r = 0; r < TM; ++r)
+		#pragma unroll
+		for (int c = 0; c < TN; ++c)
+			acc[r][c] = 0.0f;
 
+	// tid and threadsPerBlock
+	int tid  = threadIdx.y * blockDim.x + threadIdx.x;
+	int nTh  = blockDim.x * blockDim.y;
+
+	// 
 	int nPhases = (R + TS - 1) / TS;
-	for (int phase = 0; phase < nPhases; phase++) {
-		int aCol = phase * TS + threadIdx.x;
-		As[threadIdx.y][threadIdx.x] =
-			(row < M && aCol < R) ? A[row * R + aCol] : 0.0f;
+	for (int phase = 0; phase < nPhases; ++phase) {
+		int kBase = phase * TS;
+
+		for (int i = tid; i < TS * TS; i += nTh) {
+			int r = i / TS;
+			int c = i % TS;
+			int gRow = rowBlock + r;
+			int gKC  = kBase + c;
+			As[r][c] = (gRow < M && gKC < R) ? A[gRow * R + gKC] : 0.0f;
+		}
+
+		for (int i = tid; i < TS * TS; i += nTh) {
+			int k = i / TS;
+			int c = i % TS;
+			int gKR  = kBase + k;
+			int gCol = colBlock + c;
+			Bs[k][c] = (gKR < R && gCol < K)
+				? (TRANSPOSED_B ? B[gCol * R + gKR] : B[gKR * K + gCol])
+				: 0.0f;
+		}
+		__syncthreads();
 
 		#pragma unroll
-		for (int i = 0; i < TPT; i++) {
-			int col  = colBase + i * TS;
-			int bRow = phase * TS + threadIdx.y;
-			Bs[threadIdx.y][threadIdx.x] =
-				(bRow < R && col < K)
-					? (TRANSPOSED_B ? B[col * R + bRow] : B[bRow * K + col])
-					: 0.0f;
-			__syncthreads();
+		for (int k = 0; k < TS; ++k) {
+			float b[TN];
+			#pragma unroll
+			for (int c = 0; c < TN; ++c)
+				b[c] = Bs[k][tx * TN + c];
 
 			#pragma unroll
-			for (int j = 0; j < TS; j++)
-				sum[i] += As[threadIdx.y][j] * Bs[j][threadIdx.x];
-			__syncthreads();
+			for (int r = 0; r < TM; ++r) {
+				float a = As[ty * TM + r][k];
+				#pragma unroll
+				for (int c = 0; c < TN; ++c)
+					acc[r][c] += a * b[c];
+			}
 		}
+		__syncthreads();
 	}
 
 	#pragma unroll
-	for (int i = 0; i < TPT; i++) {
-		int col = colBase + i * TS;
-		if (row < M && col < K)
-			C[row * K + col] = sum[i] * inv_scale;
+	for (int r = 0; r < TM; ++r) {
+		int gRow = row0 + r;
+		if (gRow >= M) continue;
+		#pragma unroll
+		for (int c = 0; c < TN; ++c) {
+			int gCol = col0 + c;
+			if (gCol < K)
+				C[gRow * K + gCol] = acc[r][c] * inv_scale;
+		}
 	}
 }
 
+// Row-wise softmax kernel
 template <int TPB>
 __global__ void row_softmax_kernel(float* __restrict__ input, int M, int N) {
 	constexpr int NUM_WARPS = TPB / 32;
@@ -142,8 +171,9 @@ __global__ void row_softmax_kernel(float* __restrict__ input, int M, int N) {
 extern "C" void solve(const float* Q, const float* K, const float* V,
 	float* output, int M, int N, int d
 ) {
-	constexpr int TS  = 16;
-	constexpr int TPT = 2;
+	constexpr int TS  = 32;
+	constexpr int TM  = 2;
+	constexpr int TN  = 2;
 	constexpr int TPB = 256;
 
 	static float* d_score = nullptr;
@@ -156,22 +186,20 @@ extern "C" void solve(const float* Q, const float* K, const float* V,
 		cap_score = need_score;
 	}
 
-	dim3 block(TS, TS);
+	dim3 block(TS / TN, TS / TM);
 	float inv_scale = 1.0f / sqrtf((float)d);
 
 	{
-		dim3 grid((N + TS * TPT - 1) / (TS * TPT),
-				  (M + TS - 1) / TS);
-		matmul_kernel<TS, TPT, true><<<grid, block>>>(
+		dim3 grid((N + TS - 1) / TS, (M + TS - 1) / TS);
+		matmul_kernel<TS, TM, TN, true><<<grid, block>>>(
 			Q, K, d_score, M, d, N, inv_scale);
 	}
 
 	row_softmax_kernel<TPB><<<M, TPB>>>(d_score, M, N);
 
 	{
-		dim3 grid((d + TS * TPT - 1) / (TS * TPT),
-				  (M + TS - 1) / TS);
-		matmul_kernel<TS, TPT><<<grid, block>>>(
+		dim3 grid((d + TS - 1) / TS, (M + TS - 1) / TS);
+		matmul_kernel<TS, TM, TN, false><<<grid, block>>>(
 			d_score, V, output, M, N, d, 1.0f);
 	}
 }
