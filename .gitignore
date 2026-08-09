@@ -7,8 +7,6 @@ config.yaml
 *.html
 */__pycache__
 
-tmp
-kernel_log.md
 
 cs224n
 

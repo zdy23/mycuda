@@ -1,0 +1,8 @@
+GPU 0: NVIDIA GeForce RTX 3050 Laptop GPU
+  SMs: 16
+  Max threads/block: 1024
+  Max threads/SM: 1536
+  Warp size: 32
+  Global mem: 4.0 GB
+  Shared mem/block: 48 KB
+  CC: 8.6

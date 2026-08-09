@@ -131,16 +131,36 @@ __global__ void gemm_tc_kernel(
 	for (int i = 0; i < 128; ++i)
 		reg_c[i] = 0.f;
 
+	/*
+	nM: number of M fragments per warp (2 warps per block)
+	nN: number of N fragments per warp (2 warps per block)
+	vecK: number of vectorized K loads per thread (BK / 8)
+	vecN: number of vectorized N loads per thread (BN / 8)
+	nKmma: number of K fragments per warp (BK / 16)
+	*/
 	constexpr int nM = 4;
 	constexpr int nN = 8;
 	constexpr int vecK = BK / 8;
 	constexpr int vecN = BN / 8;
 	constexpr int nKmma = BK / 16;
 
+	/*
+	nTiles: number of K tiles to process (ceil(K / BK))
+	tile: current K tile index
+	*/
 	int nTiles = (K + BK - 1) / BK;
 	int tile = 0;
 
-	// each thread's fixed async-copy slot (swizzled)
+	/*
+	a_row, a_col: thread's row/col index in A tile
+	a_col_sw: swizzled column index for A tile
+	a_sm: thread's offset in shared memory for A tile
+	a_gm: thread's offset in global memory for A tile
+	b_row, b_col: thread's row/col index in B tile
+	b_col_sw: swizzled column index for B tile
+	b_sm: thread's offset in shared memory for B tile
+	b_gm: thread's offset in global memory for B tile
+	*/
 	int a_row = tid / vecK;
 	int a_col = tid % vecK;
 	int a_col_sw = (a_row % 8) ^ a_col;
