@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
 	return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
@@ -18,6 +19,7 @@ __device__ __forceinline__ void mma_f16(
 		  "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
+
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
 	if constexpr (N == 0)
@@ -32,6 +34,7 @@ __device__ __forceinline__ void cp_async16(half *smem, const half *gmem) {
 		"cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
 		:: "r"(sp), "l"(gmem));
 }
+
 
 __device__ __forceinline__ void ldmatrix_x4(half *smem, uint32_t *dst) {
 	uint32_t sp = smem_u32(smem);
@@ -49,22 +52,21 @@ __device__ __forceinline__ void ldmatrix_x4_t(half *smem, uint32_t *dst) {
 		: "r"(sp));
 }
 
-// load A fragments: swizzled smem -> reg_a
 __device__ __forceinline__ void load_a_frags(
 	half *sA, uint32_t *reg_a, int lane, int warp_row, int k_step
 ) {
-	int row = (lane % 16) + warp_row * 16;
 	int col = k_step * 2 + (lane / 16);
-	int col_sw = (row % 8) ^ col;
-	int base = row * 64 + col_sw * 8;
 	int r0 = (k_step & 1) * 16;
 
 	#pragma unroll
-	for (int i = 0; i < 4; ++i)
-		ldmatrix_x4(sA + base + i * 2048, reg_a + r0 + i * 4);
+	for (int i = 0; i < 4; ++i) {
+		int row = (lane % 16) + warp_row * 16 + i * 32;
+		int col_sw = (row % 8) ^ col;
+		int base = row * 64 + col_sw * 8;
+		ldmatrix_x4(sA + base, reg_a + r0 + i * 4);
+	}
 }
 
-// load B fragments: swizzled smem -> reg_b (transposed ldmatrix)
 __device__ __forceinline__ void load_b_frags(
 	half *sB, uint32_t *reg_b, int lane, int warp_col, int k_step
 ) {
@@ -81,7 +83,6 @@ __device__ __forceinline__ void load_b_frags(
 	}
 }
 
-// issue MMA over warp's M/N fragment tile
 __device__ __forceinline__ void mma_tile(
 	int nM, int nN, uint32_t *reg_a, uint32_t *reg_b, float *reg_c, int stage
 ) {
@@ -96,8 +97,6 @@ __device__ __forceinline__ void mma_tile(
 	}
 }
 
-// Tensor-core GEMM: BM x BN output tile, BK along K, NPIPE async stages
-// A: [M, K] row-major, B: [K, N] row-major, C: [M, N] row-major
 template <int BM, int BN, int BK, int NTHREADS, int NPIPE>
 __global__ void gemm_tc_kernel(
 	const half *__restrict__ A,
@@ -111,7 +110,6 @@ __global__ void gemm_tc_kernel(
 	int lane = tid % 32;
 	int warp_row = warp % 2;
 	int warp_col = warp / 2;
-
 	int bx = blockIdx.x;
 	int by = blockIdx.y;
 
@@ -127,12 +125,11 @@ __global__ void gemm_tc_kernel(
 	uint32_t reg_a[32];
 	uint32_t reg_b[32];
 
-	#pragma unroll
 	for (int i = 0; i < 128; ++i)
-		reg_c[i] = 0.f;
+		reg_c[i] = 0.0f;
 
-	constexpr int nM = 4;
-	constexpr int nN = 8;
+	constexpr int nM = (BM / 2) / 16;
+	constexpr int nN = (BN / 2) / 8;
 	constexpr int vecK = BK / 8;
 	constexpr int vecN = BN / 8;
 	constexpr int nKmma = BK / 16;
@@ -140,7 +137,6 @@ __global__ void gemm_tc_kernel(
 	int nTiles = (K + BK - 1) / BK;
 	int tile = 0;
 
-	// each thread's fixed async-copy slot (swizzled)
 	int a_row = tid / vecK;
 	int a_col = tid % vecK;
 	int a_col_sw = (a_row % 8) ^ a_col;
@@ -153,37 +149,44 @@ __global__ void gemm_tc_kernel(
 	int b_sm = b_row * BN + b_col_sw * 8;
 	int b_gm = b_row * N + b_col * 8;
 
-	// prefetch first NPIPE-1 stages
+	// 加载前 NPIPE - 1 个 tile
 	#pragma unroll
 	for (int p = 0; p < NPIPE - 1; ++p) {
 		half *tileA = sA + p * BM * BK;
-		half *tileB = sB + p * BN * BK;
-		const half *gAt = gA + tile * BK;
-		const half *gBt = gB + tile * BK * N;
+		half *tileB = sB + p * BK * BN;
+		const half *gAt = gA + p * BK;
+		const half *gBt = gB + p * BK * N;
+
 		#pragma unroll
-		for (int i = 0; i < 8; ++i)
+		for (int i = 0; i < 8; ++i) {
 			cp_async16(tileA + a_sm + i * 16 * BK, gAt + a_gm + i * 16 * K);
+		}
 		#pragma unroll
-		for (int i = 0; i < 8; ++i)
+		for (int i = 0; i < 8; ++i) {
 			cp_async16(tileB + b_sm + i * 8 * BN, gBt + b_gm + i * 8 * N);
+		}
 		asm volatile("cp.async.commit_group;\n" ::);
 		--nTiles;
-		if (nTiles > 0)
+		if (nTiles > 0) {
 			++tile;
+		}
 	}
 
+	// 由于前 NPIPE - 1 个 tile 已经加载到共享内存中，所以可以直接从共享内存中加载数据
 	int pipe_r = 0;
 	int pipe_w = NPIPE - 1;
 	half *curA = sA + pipe_r * BM * BK;
 	half *curB = sB + pipe_r * BN * BK;
 
+	// 等待前 NPIPE - 1 个 tile 加载完成
 	cp_async_wait<NPIPE - 2>();
 	__syncthreads();
 
+	// 加载当前 tile 的数据到寄存器中
 	load_a_frags(curA, reg_a, lane, warp_row, 0);
 	load_b_frags(curB, reg_b, lane, warp_col, 0);
 
-	// main K loop: compute current, async-load next, rotate pipes
+	// while 用来收尾，当该计算的计算了之后停止
 	while (nTiles > -(NPIPE - 1)) {
 		#pragma unroll
 		for (int kk = 0; kk < nKmma; ++kk) {
@@ -211,20 +214,20 @@ __global__ void gemm_tc_kernel(
 				for (int i = 0; i < 8; ++i)
 					cp_async16(tileB + b_sm + i * 8 * BN, gBt + b_gm + i * 8 * N);
 				asm volatile("cp.async.commit_group;\n" ::);
+				// 发了一枪预取，计数-1
 				--nTiles;
 				if (nTiles > 0)
-					++tile;
+					++tile; // 还有剩余 tile，计数+1
 				pipe_w = pipe_r;
 				pipe_r = (pipe_r == NPIPE - 1) ? 0 : pipe_r + 1;
 			}
 		}
 	}
 
+	asm volatile("cp.async.wait_all;\n" ::);
 	asm volatile("cp.async.commit_group;\n" ::);
-	asm volatile("cp.async.wait_group 0;\n" ::);
 	__syncthreads();
 
-	// reg_c -> smem as float (reuse dynamic smem)
 	float *sC = reinterpret_cast<float *>(smem);
 	#pragma unroll
 	for (int i = 0; i < nM; ++i) {
@@ -242,7 +245,6 @@ __global__ void gemm_tc_kernel(
 	}
 	__syncthreads();
 
-	// vectorized store: float4 acc (+ beta * C) -> half2 packs
 	int nVec = (BM * BN) / 4;
 	int stride = BN / 4;
 	for (int i = tid; i < nVec; i += NTHREADS) {
@@ -267,7 +269,6 @@ __global__ void gemm_tc_kernel(
 	}
 }
 
-// simple fallback for non-tuned shapes
 template <int BM, int BN, int NTHREADS>
 __global__ void gemm_naive_kernel(
 	const half *__restrict__ A,

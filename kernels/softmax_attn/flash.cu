@@ -18,6 +18,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 	return v;
 }
 
+
 template <int TPB>
 __device__ __forceinline__ float block_reduce_sum(float v, float* smem) {
 	const int warp = threadIdx.x >> 5;
