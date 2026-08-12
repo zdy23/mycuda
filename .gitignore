@@ -1,11 +1,14 @@
 config.yaml
 .comet.config
 
+.kilo
 .venv-cuda
 .claude
 .clangd
 *.html
 */__pycache__
+
+tmp
 
 
 cs224n
