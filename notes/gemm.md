@@ -137,9 +137,6 @@ $$
 
 This means that for every byte loaded from memory, the GPU performs about 64 floating-point operations. Higher arithmetic intensity usually means better use of memory bandwidth and better performance.
 
-### CUDA
-
-{{< include file="src_code/leetgpu/gemm.md" >}}
 
 ### Performance
 
